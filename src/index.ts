@@ -5,8 +5,8 @@ import {
   PROVIDER_PACKAGE,
 } from "./constants.js";
 import { fetchGatewayModels } from "./discovery.js";
-import { purgeLegacyFileCache } from "./cache.js";
-import { displayName, familyOf, isImage, isReasoning, lookup } from "./fallback.js";
+import { keyFingerprint, purgeLegacyFileCache } from "./cache.js";
+import { displayName, effortSuffix, familyOf, isImage, isReasoning, lookup, stripEffortSuffix, supportsEffortVariants } from "./fallback.js";
 
 interface RuroutOptions {
   baseURL?: string;
@@ -71,6 +71,7 @@ function toModel(canonical: string, apiId: string, display: string | undefined, 
   const text = !canonical.startsWith("gpt-image-");
   const input = fallback.input > 0 ? fallback.input : 1;
   const output = fallback.outputCost > 0 ? fallback.outputCost : 5;
+  const effort = supportsEffortVariants(apiId);
   return {
     id: canonical,
     modelID: apiId,
@@ -84,7 +85,13 @@ function toModel(canonical: string, apiId: string, display: string | undefined, 
       input: image ? ["text", "image"] : ["text"],
       output: image || !text ? ["image"] : ["text"],
     },
-    variants: [],
+    variants: effort
+      ? [
+          { id: "low", settings: { reasoningEffort: "low" } },
+          { id: "medium", settings: { reasoningEffort: "medium" } },
+          { id: "high", settings: { reasoningEffort: "high" } },
+        ]
+      : [],
     time: { released: 0 },
     cost: [
       {
@@ -102,6 +109,39 @@ function toModel(canonical: string, apiId: string, display: string | undefined, 
 
 const KEY_WATCH_INTERVAL_MS = 15_000;
 const MODEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const MODEL_PROBE_TTL_MS = 6 * 60 * 60 * 1000;
+const probeCache = new Map<string, { ok: boolean; at: number }>();
+
+function probeCacheKey(apiKey: string, model: string): string {
+  return `${keyFingerprint(apiKey)}:${model}`;
+}
+
+async function probeChat(baseURL: string, apiKey: string, model: string): Promise<boolean> {
+  const cacheKey = probeCacheKey(apiKey, model);
+  const cached = probeCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < MODEL_PROBE_TTL_MS) return cached.ok;
+  let ok = false;
+  try {
+    const response = await fetch(`${baseURL.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      signal: AbortSignal.timeout(15000),
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 1,
+      }),
+    });
+    if (response.ok) {
+      const body = (await response.json()) as { choices?: unknown[]; error?: unknown };
+      ok = Array.isArray(body.choices) && !body.error;
+    }
+  } catch {
+    ok = false;
+  }
+  probeCache.set(cacheKey, { ok, at: Date.now() });
+  return ok;
+}
 
 async function applyModels(
   ctx: PluginContext,
@@ -111,13 +151,35 @@ async function applyModels(
 ): Promise<boolean> {
   const live = await fetchGatewayModels(baseURL, apiKey);
   if (!isCurrent()) return false;
-  const models = [...new Map(live.map((model) => [model.id, model])).values()].map((model) => {
-    const result = toModel(model.id, model.id, model.display_name, PROVIDER_ID);
-    result.display = model.display_name ?? model.id;
-    return result;
-  });
+  const byId = new Map(live.map((model) => [model.id, model]));
+  const seen = new Set<string>();
+  const models: AnyRecord[] = [];
+  for (const entry of byId.values()) {
+    const suffix = effortSuffix(entry.id);
+    if (suffix === "high" || suffix === "medium" || suffix === "low") {
+      const tieredId = `${stripEffortSuffix(entry.id)}-tiered`;
+      if (byId.has(tieredId)) continue;
+    }
+    if (suffix === "tiered") {
+      const base = stripEffortSuffix(entry.id);
+      const baseEntry = byId.get(base);
+      if (baseEntry && (await probeChat(baseURL, apiKey, base))) {
+        continue;
+      }
+      const result = toModel(base, entry.id, baseEntry?.display_name ?? entry.display_name, PROVIDER_ID);
+      result.display = baseEntry?.display_name ?? entry.display_name ?? base;
+      models.push(result);
+      seen.add(base);
+      continue;
+    }
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const result = toModel(entry.id, entry.id, entry.display_name, PROVIDER_ID);
+    result.display = entry.display_name ?? entry.id;
+    models.push(result);
+  }
   if (!isCurrent()) return false;
-  const seen = new Set(models.map((m) => m.id));
+  const wanted = new Set(models.map((m) => m.id));
   await ctx.catalog.transform((draft: AnyRecord) => {
     if (!isCurrent()) return;
     draft.provider.update(PROVIDER_ID, (provider: AnyRecord) => {
@@ -131,16 +193,16 @@ async function applyModels(
       const storedIds: string[] =
         stored instanceof Map ? [...stored.keys()] : Object.keys(stored ?? {});
       for (const id of storedIds) {
-        if (!seen.has(id)) {
+        if (!wanted.has(id)) {
           try {
             draft.model.remove(PROVIDER_ID, id);
           } catch {
-              // Model may already be gone; ignore per-model errors.
-            }
+            continue;
+          }
         }
       }
     } catch {
-      // Stale cleanup is best-effort; discovery below still applies.
+      return;
     }
     for (const model of models) {
       draft.model.update(PROVIDER_ID, model.id, (target: AnyRecord) => {
@@ -183,7 +245,6 @@ const plugin: PluginDef = {
     const refresh = async (key: string, clearFirst: boolean) => {
       const version = ++refreshVersion;
       if (clearFirst) {
-        // Do not leave models from the previous key selectable while discovery runs.
         await ctx.catalog.transform((draft: AnyRecord) => {
           const rec = draft.provider.list().find((r: AnyRecord) => r.provider?.id === PROVIDER_ID);
           const stored = rec?.models;
@@ -198,8 +259,7 @@ const plugin: PluginDef = {
         const applied = await applyModels(ctx, baseURL, key, () => version === refreshVersion && key === lastKey);
         if (applied) await ctx.catalog.reload().catch(() => undefined);
       } catch {
-        // Keep the last successful list for periodic refreshes. A changed key was
-        // cleared above, so unavailable models are never carried to the new key.
+        // Keep the last successful list on discovery failure.
       }
     };
     if (lastKey) await refresh(lastKey, false);
@@ -239,7 +299,7 @@ const plugin: PluginDef = {
           }
         }
       } catch {
-        // Aborted on dispose.
+        return;
       }
     })();
 

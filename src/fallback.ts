@@ -91,6 +91,19 @@ export function isReasoning(id: string): boolean {
   return id.includes("thinking");
 }
 
+export function effortSuffix(id: string): string | undefined {
+  const m = id.match(/-(high|medium|low|tiered)$/i);
+  return m ? m[1]!.toLowerCase() : undefined;
+}
+
+export function stripEffortSuffix(id: string): string {
+  return id.replace(/-(high|medium|low|tiered)$/i, "");
+}
+
+export function supportsEffortVariants(id: string): boolean {
+  return /-tiered$/i.test(id);
+}
+
 export function canonicalId(id: string): string {
   let s = id.trim();
   s = s.replace(/-tiered$/i, "");

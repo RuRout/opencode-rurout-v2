@@ -4,9 +4,9 @@ import {
   PROVIDER_NAME,
   PROVIDER_PACKAGE,
 } from "./constants.js";
-import { fetchGatewayModels } from "./discovery.js";
+import { fetchGatewayModels, type GatewayModel } from "./discovery.js";
 import { keyFingerprint, purgeLegacyFileCache } from "./cache.js";
-import { displayName, effortSuffix, familyOf, isImage, isReasoning, lookup, stripEffortSuffix, supportsEffortVariants } from "./fallback.js";
+import { displayName, effortSuffix, familyOf, isImage, isReasoning, lookup, stripEffortSuffix } from "./fallback.js";
 
 interface RuroutOptions {
   baseURL?: string;
@@ -54,10 +54,19 @@ function credentialKey(credential: AnyRecord | undefined): string {
   return "";
 }
 
-async function resolveApiKey(ctx: PluginContext): Promise<string> {
+/**
+ * Single source of truth for "which key is active right now".
+ * Always resolved fresh — never trusted from event payloads (the
+ * `integration.connection.updated` event only carries `{ integrationID }`,
+ * no key material), so every sync path observes the same state.
+ */
+async function getActiveKey(ctx: PluginContext): Promise<string> {
   try {
     const connection = await ctx.integration.connection.active(PROVIDER_ID);
     if (!connection) return process.env.RUROUT_API_KEY ?? "";
+    if (connection.type === "env" && typeof connection.name === "string") {
+      return process.env[connection.name] ?? process.env.RUROUT_API_KEY ?? "";
+    }
     const credential = await ctx.integration.connection.resolve(connection);
     return credentialKey(credential) || process.env.RUROUT_API_KEY || "";
   } catch {
@@ -65,13 +74,23 @@ async function resolveApiKey(ctx: PluginContext): Promise<string> {
   }
 }
 
-function toModel(canonical: string, apiId: string, display: string | undefined, providerID: string): AnyRecord {
+function isAuthError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /rejected|invalid or disabled/i.test(msg);
+}
+
+function toModel(
+  canonical: string,
+  apiId: string,
+  display: string | undefined,
+  providerID: string,
+  effort: boolean,
+): AnyRecord {
   const fallback = lookup(canonical);
   const image = isImage(canonical);
   const text = !canonical.startsWith("gpt-image-");
   const input = fallback.input > 0 ? fallback.input : 1;
   const output = fallback.outputCost > 0 ? fallback.outputCost : 5;
-  const effort = supportsEffortVariants(apiId);
   return {
     id: canonical,
     modelID: apiId,
@@ -107,112 +126,63 @@ function toModel(canonical: string, apiId: string, display: string | undefined, 
   };
 }
 
-const KEY_WATCH_INTERVAL_MS = 15_000;
-const MODEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
-const MODEL_PROBE_TTL_MS = 6 * 60 * 60 * 1000;
-const probeCache = new Map<string, { ok: boolean; at: number }>();
-
-function probeCacheKey(apiKey: string, model: string): string {
-  return `${keyFingerprint(apiKey)}:${model}`;
+function pickTransport(ids: string[]): string {
+  const rank = (id: string): number => {
+    const suffix = effortSuffix(id);
+    if (suffix === "tiered") return 0;
+    if (suffix === "high") return 1;
+    if (!suffix) return 2;
+    if (suffix === "medium") return 3;
+    if (suffix === "low") return 4;
+    return 5;
+  };
+  return [...ids].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : 1))[0]!;
 }
 
-async function probeChat(baseURL: string, apiKey: string, model: string): Promise<boolean> {
-  const cacheKey = probeCacheKey(apiKey, model);
-  const cached = probeCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < MODEL_PROBE_TTL_MS) return cached.ok;
-  let ok = false;
-  try {
-    const response = await fetch(`${baseURL.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      signal: AbortSignal.timeout(15000),
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-      }),
-    });
-    if (response.ok) {
-      const body = (await response.json()) as { choices?: unknown[]; error?: unknown };
-      ok = Array.isArray(body.choices) && !body.error;
-    }
-  } catch {
-    ok = false;
-  }
-  probeCache.set(cacheKey, { ok, at: Date.now() });
-  return ok;
-}
-
-async function applyModels(
-  ctx: PluginContext,
-  baseURL: string,
-  apiKey: string,
-  isCurrent: () => boolean,
-): Promise<boolean> {
-  const live = await fetchGatewayModels(baseURL, apiKey);
-  if (!isCurrent()) return false;
+function buildModels(live: GatewayModel[]): AnyRecord[] {
   const byId = new Map(live.map((model) => [model.id, model]));
-  const seen = new Set<string>();
-  const models: AnyRecord[] = [];
+  const groups = new Map<string, GatewayModel[]>();
   for (const entry of byId.values()) {
     const suffix = effortSuffix(entry.id);
-    if (suffix === "high" || suffix === "medium" || suffix === "low") {
-      const tieredId = `${stripEffortSuffix(entry.id)}-tiered`;
-      if (byId.has(tieredId)) continue;
-    }
-    if (suffix === "tiered") {
-      const base = stripEffortSuffix(entry.id);
-      const baseEntry = byId.get(base);
-      if (baseEntry && (await probeChat(baseURL, apiKey, base))) {
-        continue;
-      }
-      const result = toModel(base, entry.id, baseEntry?.display_name ?? entry.display_name, PROVIDER_ID);
-      result.display = baseEntry?.display_name ?? entry.display_name ?? base;
+    const base = suffix ? stripEffortSuffix(entry.id) : entry.id;
+    const group = groups.get(base) ?? [];
+    group.push(entry);
+    groups.set(base, group);
+  }
+  const models: AnyRecord[] = [];
+  for (const [base, entries] of groups) {
+    const family = entries.length > 1 || entries.some((entry) => effortSuffix(entry.id));
+    if (!family) {
+      const entry = entries[0]!;
+      const result = toModel(entry.id, entry.id, entry.display_name, PROVIDER_ID, false);
+      result.display = entry.display_name ?? entry.id;
       models.push(result);
-      seen.add(base);
       continue;
     }
-    if (seen.has(entry.id)) continue;
-    seen.add(entry.id);
-    const result = toModel(entry.id, entry.id, entry.display_name, PROVIDER_ID);
-    result.display = entry.display_name ?? entry.id;
+    const transport = pickTransport(entries.map((entry) => entry.id));
+    const transportEntry = byId.get(transport);
+    const result = toModel(base, transport, transportEntry?.display_name, PROVIDER_ID, true);
+    result.display = transportEntry?.display_name ?? base;
     models.push(result);
   }
-  if (!isCurrent()) return false;
-  const wanted = new Set(models.map((m) => m.id));
-  await ctx.catalog.transform((draft: AnyRecord) => {
-    if (!isCurrent()) return;
-    draft.provider.update(PROVIDER_ID, (provider: AnyRecord) => {
-      provider.name = PROVIDER_NAME;
-      provider.package = PROVIDER_PACKAGE;
-      provider.settings = { ...(provider.settings ?? {}), apiKey, baseURL };
-    });
-    try {
-      const rec = draft.provider.list().find((r: AnyRecord) => r.provider?.id === PROVIDER_ID);
-      const stored = rec?.models;
-      const storedIds: string[] =
-        stored instanceof Map ? [...stored.keys()] : Object.keys(stored ?? {});
-      for (const id of storedIds) {
-        if (!wanted.has(id)) {
-          try {
-            draft.model.remove(PROVIDER_ID, id);
-          } catch {
-            continue;
-          }
-        }
-      }
-    } catch {
-      return;
-    }
-    for (const model of models) {
-      draft.model.update(PROVIDER_ID, model.id, (target: AnyRecord) => {
-        Object.assign(target, model);
-        delete target.display;
-      });
-    }
-  });
-  return true;
+  return models;
 }
+
+// ─── Single-path key sync ────────────────────────────────────────────────────
+// One rule for every trigger (startup, account event, poll, hourly, pre-request):
+//   key selected → models rebuilt from scratch for THAT key, atomically.
+//
+// Previous generations of this file had four overlapping paths (event hint key,
+// 5s poll with its own compare, hourly with clearFirst, sdk-hook settle loop)
+// that could interleave: a slow fetch for key A would overwrite a fresh list
+// for key B, and the catalog kept showing the old key's models for seconds
+// after a switch. Now there is exactly one `sync()` and one serial queue.
+// Stale results are discarded by re-resolving the active key after the fetch.
+
+const POLL_MS = 5_000;
+const HOURLY_MS = 60 * 60 * 1000;
+const SDK_WAIT_MS = 30_000;
+const PER_KEY_CACHE_LIMIT = 20;
 
 const plugin: PluginDef = {
   id: "rurout",
@@ -240,63 +210,172 @@ const plugin: PluginDef = {
 
     await purgeLegacyFileCache();
 
-    let lastKey = await resolveApiKey(ctx);
-    let refreshVersion = 0;
-    const refresh = async (key: string, clearFirst: boolean) => {
-      const version = ++refreshVersion;
-      if (clearFirst) {
-        await ctx.catalog.transform((draft: AnyRecord) => {
+    let disposed = false;
+    // Last key fully written to the catalog (with its own models, or an empty
+    // list for a rejected key). `undefined` = never synced since startup.
+    let syncedKey: string | undefined;
+    // Last-known-good models per key hash. Lets a repeated switch render
+    // instantly from memory instead of waiting out a network round-trip.
+    // Model ids are not secrets; keyed by hash so raw keys never linger here.
+    const perKeyModels = new Map<string, AnyRecord[]>();
+    // Serial queue: every sync runs to completion before the next starts,
+    // so a slow fetch can never overwrite a newer result out of order.
+    // `flight` is the in-flight discovery fetch: a newer user-intent trigger
+    // (account event, pre-request) aborts it so a stale fetch never blocks
+    // the fresh one — single-flight, last writer wins.
+    let tail: Promise<void> = Promise.resolve();
+    let flight: AbortController | null = null;
+
+    function remember(key: string, models: AnyRecord[]): void {
+      perKeyModels.set(keyFingerprint(key), models);
+      while (perKeyModels.size > PER_KEY_CACHE_LIMIT) {
+        const oldest = perKeyModels.keys().next();
+        if (oldest.done) break;
+        perKeyModels.delete(oldest.value);
+      }
+    }
+
+    async function writeCatalog(key: string, models: AnyRecord[]): Promise<void> {
+      if (disposed) return;
+      const wanted = new Set(models.map((model) => model.id));
+      await ctx.catalog.transform((draft: AnyRecord) => {
+        draft.provider.update(PROVIDER_ID, (provider: AnyRecord) => {
+          provider.name = PROVIDER_NAME;
+          provider.package = PROVIDER_PACKAGE;
+          const settings = { ...((provider.settings ?? {}) as Record<string, unknown>) } as AnyRecord;
+          if (key) {
+            settings.apiKey = key;
+          } else {
+            delete settings.apiKey;
+          }
+          settings.baseURL = baseURL;
+          provider.settings = settings;
+        });
+        try {
           const rec = draft.provider.list().find((r: AnyRecord) => r.provider?.id === PROVIDER_ID);
           const stored = rec?.models;
-          const ids = stored instanceof Map ? [...stored.keys()] : Object.keys(stored ?? {});
-          for (const id of ids) draft.model.remove(PROVIDER_ID, id);
-        });
-        await ctx.catalog.reload().catch(() => undefined);
-      }
-      if (!key) return;
-      await purgeLegacyFileCache();
-      try {
-        const applied = await applyModels(ctx, baseURL, key, () => version === refreshVersion && key === lastKey);
-        if (applied) await ctx.catalog.reload().catch(() => undefined);
-      } catch {
-        // Keep the last successful list on discovery failure.
-      }
-    };
-    if (lastKey) await refresh(lastKey, false);
-
-    const keyWatchTimer = setInterval(() => {
-      void (async () => {
-        const key = await resolveApiKey(ctx);
-        if (key !== lastKey) {
-          lastKey = key;
-          await refresh(key, true);
+          const storedIds: string[] =
+            stored instanceof Map ? [...stored.keys()] : Object.keys(stored ?? {});
+          for (const id of storedIds) {
+            if (!wanted.has(id)) {
+              try {
+                draft.model.remove(PROVIDER_ID, id);
+              } catch {
+                continue;
+              }
+            }
+          }
+        } catch {
+          return;
         }
-      })();
-    }, KEY_WATCH_INTERVAL_MS);
-    if (typeof (keyWatchTimer as unknown as { unref?: () => void }).unref === "function") {
-      (keyWatchTimer as unknown as { unref: () => void }).unref();
+        for (const model of models) {
+          draft.model.update(PROVIDER_ID, model.id, (target: AnyRecord) => {
+            Object.assign(target, model);
+            delete target.display;
+          });
+        }
+      });
+      await ctx.catalog.reload().catch(() => undefined);
     }
 
-    const hourlyRefreshTimer = setInterval(() => {
-      void refresh(lastKey, false);
-    }, MODEL_REFRESH_INTERVAL_MS);
-    if (typeof (hourlyRefreshTimer as unknown as { unref?: () => void }).unref === "function") {
-      (hourlyRefreshTimer as unknown as { unref: () => void }).unref();
+    async function sync(reason: string, force: boolean): Promise<void> {
+      if (disposed) return;
+      void reason;
+      const key = await getActiveKey(ctx);
+      if (disposed) return;
+      if (!force && key === syncedKey) return;
+
+      if (key !== syncedKey) {
+        // The key changed: never leave the previous key's models selectable.
+        // Show this key's last-known list instantly when we have one,
+        // otherwise wipe to empty while the fresh discovery runs.
+        const cached = key ? perKeyModels.get(keyFingerprint(key)) : undefined;
+        await writeCatalog(key, cached ?? []);
+        if (disposed) return;
+        // syncedKey stays untouched until the fetch below succeeds: a failed
+        // fetch keeps retrying on the next trigger instead of looking "done".
+      }
+
+      if (!key) {
+        syncedKey = key;
+        return;
+      }
+
+      const ctrl = new AbortController();
+      flight = ctrl;
+      let live: GatewayModel[];
+      try {
+        live = await fetchGatewayModels(baseURL, key, 3, ctrl.signal);
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
+        if (isAuthError(err)) {
+          // Rejected key: record the empty list so its (lack of) models is
+          // honest and the poll fast-path stops hammering the gateway.
+          await writeCatalog(key, []);
+          syncedKey = key;
+        }
+        // Transient network failure: keep whatever the instant step wrote
+        // (cached or empty) and retry on the next trigger.
+        return;
+      } finally {
+        if (flight === ctrl) flight = null;
+      }
+      if (disposed) return;
+
+      // The fetch took a while: if the user switched again mid-flight,
+      // this result belongs to a key that is no longer active — drop it.
+      // The trigger for the newer key already queued its own sync.
+      const current = await getActiveKey(ctx);
+      if (disposed) return;
+      if (current !== key) return;
+
+      const models = buildModels(live);
+      remember(key, models);
+      await writeCatalog(key, models);
+      syncedKey = key;
+      await purgeLegacyFileCache();
     }
 
+    function schedule(reason: string, force = false, preempt = false): Promise<void> {
+      if (preempt) flight?.abort();
+      tail = tail.then(() => sync(reason, force)).catch(() => undefined);
+      return tail;
+    }
+
+    // Startup: populate before the first `/models` call.
+    schedule("startup", true);
+    await tail;
+
+    const pollTimer = setInterval(() => {
+      void schedule("poll", false);
+    }, POLL_MS);
+    if (typeof (pollTimer as unknown as { unref?: () => void }).unref === "function") {
+      (pollTimer as unknown as { unref: () => void }).unref();
+    }
+
+    const hourlyTimer = setInterval(() => {
+      void schedule("hourly", true);
+    }, HOURLY_MS);
+    if (typeof (hourlyTimer as unknown as { unref?: () => void }).unref === "function") {
+      (hourlyTimer as unknown as { unref: () => void }).unref();
+    }
+
+    // Account events: run the same sync immediately (preempting any stale
+    // in-flight fetch). The key is always re-resolved inside sync, and burst
+    // duplicates collapse on the `syncedKey` fast-path — no debounce needed.
     const eventController = new AbortController();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
-          if (event?.type !== "integration.connection.updated") continue;
-          const updatedID = (event.data as AnyRecord | undefined)?.integrationID
-            ?? (event.properties as AnyRecord | undefined)?.integrationID;
-          if (updatedID && updatedID !== PROVIDER_ID) continue;
-          const key = await resolveApiKey(ctx);
-          if (key !== lastKey) {
-            lastKey = key;
-            await refresh(key, true);
+          if (disposed) return;
+          const type = event?.type as string | undefined;
+          if (type !== "integration.connection.updated" && type !== "integration.updated") continue;
+          if (type === "integration.connection.updated") {
+            const updatedID = (event.data as AnyRecord | undefined)?.integrationID
+              ?? (event.properties as AnyRecord | undefined)?.integrationID;
+            if (updatedID && updatedID !== PROVIDER_ID) continue;
           }
+          void schedule("event", false, true);
         }
       } catch {
         return;
@@ -305,20 +384,26 @@ const plugin: PluginDef = {
 
     await ctx.aisdk.hook("sdk", async (event: AnyRecord) => {
       if (event.model?.providerID !== PROVIDER_ID) return;
-      const key = await resolveApiKey(ctx);
+      // Requests always authenticate as the *currently selected* account,
+      // even if the catalog list is still catching up to a fresh switch.
+      const key = await getActiveKey(ctx);
       if (!key) return;
-      event.options = { ...(event.options ?? {}), apiKey: key, baseURL };
-      const changed = key !== lastKey;
-      if (changed) {
-        lastKey = key;
+      if (key !== syncedKey) {
+        const wait = schedule("sdk", false, true);
+        await Promise.race([
+          wait,
+          new Promise((resolve) => setTimeout(resolve, SDK_WAIT_MS)),
+        ]);
       }
-      await refresh(key, changed);
+      event.options = { ...(event.options ?? {}), apiKey: key, baseURL };
     });
 
     return () => {
+      disposed = true;
       eventController.abort();
-      clearInterval(keyWatchTimer);
-      clearInterval(hourlyRefreshTimer);
+      flight?.abort();
+      clearInterval(pollTimer);
+      clearInterval(hourlyTimer);
     };
   },
 };

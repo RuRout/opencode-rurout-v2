@@ -10,7 +10,7 @@ OpenCode **2.x** provider plugin for [RuRout](https://rurout.online) — your ga
 - New `RuRout` provider in the OpenCode model picker, next to the built-ins.
 - Model list discovered live from `GET /v1/models` with the active key — each client sees exactly the models that key allows.
 - Single API key: a new key replaces the old model list (stale models are removed).
-- The active key is checked on startup, after a key change (within 15 seconds or on first use), and hourly without a restart. Stale `~/.cache/opencode-rurout/models-*.json` files are deleted on startup.
+- The active key is checked on startup, instantly on account switch (stale models are wiped first, then rebuilt from `GET /v1/models` for the new key), on first use, every 5 seconds as a safety net, and hourly without a restart. Stale `~/.cache/opencode-rurout/models-*.json` files are deleted on startup.
 
 ## Install (OpenCode 2.x only)
 

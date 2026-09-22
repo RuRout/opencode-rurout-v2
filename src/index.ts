@@ -30,6 +30,9 @@ interface PluginContext {
   aisdk: {
     hook: (name: string, cb: (event: AnyRecord) => Promise<void> | void) => Promise<unknown>;
   };
+  event: {
+    subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<AnyRecord>;
+  };
 }
 
 interface PluginDef {
@@ -97,36 +100,6 @@ function toModel(canonical: string, apiId: string, display: string | undefined, 
   };
 }
 
-async function fetchKeyLabel(baseURL: string, apiKey: string): Promise<string> {
-  try {
-    const response = await fetch(`${baseURL.replace(/\/$/, "")}/sub2api/billing`, {
-      signal: AbortSignal.timeout(10000),
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (!response.ok) return "";
-    const body = (await response.json()) as { key_name?: unknown; group_name?: unknown };
-    const keyName = typeof body.key_name === "string" ? body.key_name.trim() : "";
-    const groupName = typeof body.group_name === "string" ? body.group_name.trim() : "";
-    return keyName || groupName;
-  } catch {
-    return "";
-  }
-}
-
-function sanitizeLabel(raw: string): string {
-  const cleaned = raw
-    .replace(/[^\p{L}\p{N} _-]+/gu, "")
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 32);
-  if (!cleaned) return "";
-  return cleaned
-    .split(" ")
-    .map((w) => (w ? w[0]!.toUpperCase() + w.slice(1) : w))
-    .join(" ");
-}
-
 const KEY_WATCH_INTERVAL_MS = 15_000;
 const MODEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -138,21 +111,19 @@ async function applyModels(
 ): Promise<boolean> {
   const live = await fetchGatewayModels(baseURL, apiKey);
   if (!isCurrent()) return false;
-  // Keep every exact gateway ID. A model must always be requested with the ID
-  // that the key's /models endpoint granted, rather than an alias from another key.
   const models = [...new Map(live.map((model) => [model.id, model])).values()].map((model) => {
     const result = toModel(model.id, model.id, model.display_name, PROVIDER_ID);
     result.display = model.display_name ?? model.id;
     return result;
   });
-  const keyLabel = sanitizeLabel(await fetchKeyLabel(baseURL, apiKey));
   if (!isCurrent()) return false;
-  const providerName = keyLabel ? `RuRout ${keyLabel}` : PROVIDER_NAME;
   const seen = new Set(models.map((m) => m.id));
   await ctx.catalog.transform((draft: AnyRecord) => {
     if (!isCurrent()) return;
     draft.provider.update(PROVIDER_ID, (provider: AnyRecord) => {
-      provider.name = providerName;
+      provider.name = PROVIDER_NAME;
+      provider.package = PROVIDER_PACKAGE;
+      provider.settings = { ...(provider.settings ?? {}), apiKey, baseURL };
     });
     try {
       const rec = draft.provider.list().find((r: AnyRecord) => r.provider?.id === PROVIDER_ID);
@@ -175,9 +146,6 @@ async function applyModels(
       draft.model.update(PROVIDER_ID, model.id, (target: AnyRecord) => {
         Object.assign(target, model);
         delete target.display;
-        if (keyLabel) {
-          target.name = `${providerName} ${displayName(model.modelID, model.display)}`;
-        }
       });
     }
   });
@@ -193,10 +161,6 @@ const plugin: PluginDef = {
     await ctx.integration.transform((draft: AnyRecord) => {
       draft.update(PROVIDER_ID, (ref: AnyRecord) => {
         ref.name = PROVIDER_NAME;
-      });
-      draft.method.update({
-        integrationID: PROVIDER_ID,
-        method: { type: "env", names: ["RUROUT_API_KEY"] },
       });
       draft.method.update({
         integrationID: PROVIDER_ID,
@@ -249,14 +213,35 @@ const plugin: PluginDef = {
         }
       })();
     }, KEY_WATCH_INTERVAL_MS);
+    if (typeof (keyWatchTimer as unknown as { unref?: () => void }).unref === "function") {
+      (keyWatchTimer as unknown as { unref: () => void }).unref();
+    }
+
     const hourlyRefreshTimer = setInterval(() => {
       void refresh(lastKey, false);
     }, MODEL_REFRESH_INTERVAL_MS);
-    for (const timer of [keyWatchTimer, hourlyRefreshTimer]) {
-      if (typeof (timer as unknown as { unref?: () => void }).unref === "function") {
-        (timer as unknown as { unref: () => void }).unref();
-      }
+    if (typeof (hourlyRefreshTimer as unknown as { unref?: () => void }).unref === "function") {
+      (hourlyRefreshTimer as unknown as { unref: () => void }).unref();
     }
+
+    const eventController = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
+          if (event?.type !== "integration.connection.updated") continue;
+          const updatedID = (event.data as AnyRecord | undefined)?.integrationID
+            ?? (event.properties as AnyRecord | undefined)?.integrationID;
+          if (updatedID && updatedID !== PROVIDER_ID) continue;
+          const key = await resolveApiKey(ctx);
+          if (key !== lastKey) {
+            lastKey = key;
+            await refresh(key, true);
+          }
+        }
+      } catch {
+        // Aborted on dispose.
+      }
+    })();
 
     await ctx.aisdk.hook("sdk", async (event: AnyRecord) => {
       if (event.model?.providerID !== PROVIDER_ID) return;
@@ -271,6 +256,7 @@ const plugin: PluginDef = {
     });
 
     return () => {
+      eventController.abort();
       clearInterval(keyWatchTimer);
       clearInterval(hourlyRefreshTimer);
     };

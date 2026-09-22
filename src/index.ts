@@ -7,6 +7,9 @@ import {
 import { fetchGatewayModels, type GatewayModel } from "./discovery.js";
 import { keyFingerprint, purgeLegacyFileCache } from "./cache.js";
 import { displayName, effortSuffix, familyOf, isImage, isReasoning, lookup, stripEffortSuffix } from "./fallback.js";
+import { appendFile, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 interface RuroutOptions {
   baseURL?: string;
@@ -183,6 +186,35 @@ const POLL_MS = 5_000;
 const HOURLY_MS = 60 * 60 * 1000;
 const SDK_WAIT_MS = 30_000;
 const PER_KEY_CACHE_LIMIT = 20;
+const TRACE_PATH = join(tmpdir(), "rurout-sync.log");
+const TRACE_MAX_BYTES = 200_000;
+
+// Append-only debug trace (no key material — hashes only). Proves which sync
+// ran, what it decided, and why. Capped so it can stay on permanently.
+function trace(msg: string): void {
+  const line = `${new Date().toISOString()} ${msg}\n`;
+  void (async () => {
+    try {
+      let size = 0;
+      try {
+        size = (await stat(TRACE_PATH)).size;
+      } catch {
+        // Missing file — will be created below.
+      }
+      if (size >= TRACE_MAX_BYTES) {
+        await writeFile(TRACE_PATH, line);
+      } else {
+        await appendFile(TRACE_PATH, line);
+      }
+    } catch {
+      // Tracing must never break syncing.
+    }
+  })();
+}
+
+function shortHash(key: string): string {
+  return key ? keyFingerprint(key).slice(0, 8) : "(none)";
+}
 
 const plugin: PluginDef = {
   id: "rurout",
@@ -218,12 +250,15 @@ const plugin: PluginDef = {
     // instantly from memory instead of waiting out a network round-trip.
     // Model ids are not secrets; keyed by hash so raw keys never linger here.
     const perKeyModels = new Map<string, AnyRecord[]>();
-    // Serial queue: every sync runs to completion before the next starts,
-    // so a slow fetch can never overwrite a newer result out of order.
+    // Coalescing single-flight: at most one sync runs, at most one waits.
+    // Burst triggers merge into the waiting slot instead of piling full
+    // fetches behind each other (a slow gateway + 5s poll used to grow an
+    // unbounded queue and delay a real switch by the whole backlog).
     // `flight` is the in-flight discovery fetch: a newer user-intent trigger
     // (account event, pre-request) aborts it so a stale fetch never blocks
-    // the fresh one — single-flight, last writer wins.
-    let tail: Promise<void> = Promise.resolve();
+    // the fresh one — last writer wins.
+    let worker: Promise<void> | null = null;
+    let wanted: { reason: string; force: boolean } | null = null;
     let flight: AbortController | null = null;
 
     function remember(key: string, models: AnyRecord[]): void {
@@ -280,20 +315,26 @@ const plugin: PluginDef = {
 
     async function sync(reason: string, force: boolean): Promise<void> {
       if (disposed) return;
-      void reason;
+      const startedAt = Date.now();
       const key = await getActiveKey(ctx);
       if (disposed) return;
-      if (!force && key === syncedKey) return;
+      if (!force && key === syncedKey) {
+        trace(`sync reason=${reason} key=${shortHash(key)} noop already-synced`);
+        return;
+      }
 
       if (key !== syncedKey) {
         // The key changed: never leave the previous key's models selectable.
         // Show this key's last-known list instantly when we have one,
         // otherwise wipe to empty while the fresh discovery runs.
         const cached = key ? perKeyModels.get(keyFingerprint(key)) : undefined;
+        trace(`sync reason=${reason} key=${shortHash(key)} changed instant=${cached ? `${cached.length}-cached` : "wipe"}`);
         await writeCatalog(key, cached ?? []);
         if (disposed) return;
         // syncedKey stays untouched until the fetch below succeeds: a failed
         // fetch keeps retrying on the next trigger instead of looking "done".
+      } else {
+        trace(`sync reason=${reason} key=${shortHash(key)} force-refresh`);
       }
 
       if (!key) {
@@ -307,15 +348,21 @@ const plugin: PluginDef = {
       try {
         live = await fetchGatewayModels(baseURL, key, 3, ctrl.signal);
       } catch (err) {
-        if (err instanceof Error && err.name === "AbortError") return;
+        if (err instanceof Error && err.name === "AbortError") {
+          trace(`sync reason=${reason} key=${shortHash(key)} superseded`);
+          return;
+        }
         if (isAuthError(err)) {
           // Rejected key: record the empty list so its (lack of) models is
           // honest and the poll fast-path stops hammering the gateway.
+          trace(`sync reason=${reason} key=${shortHash(key)} auth-rejected`);
           await writeCatalog(key, []);
           syncedKey = key;
+          return;
         }
         // Transient network failure: keep whatever the instant step wrote
         // (cached or empty) and retry on the next trigger.
+        trace(`sync reason=${reason} key=${shortHash(key)} fetch-failed ${err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120)}`);
         return;
       } finally {
         if (flight === ctrl) flight = null;
@@ -327,24 +374,49 @@ const plugin: PluginDef = {
       // The trigger for the newer key already queued its own sync.
       const current = await getActiveKey(ctx);
       if (disposed) return;
-      if (current !== key) return;
+      if (current !== key) {
+        trace(`sync reason=${reason} key=${shortHash(key)} discarded key-moved`);
+        return;
+      }
 
       const models = buildModels(live);
       remember(key, models);
       await writeCatalog(key, models);
       syncedKey = key;
+      trace(`sync reason=${reason} key=${shortHash(key)} done n=${models.length} ms=${Date.now() - startedAt}`);
       await purgeLegacyFileCache();
     }
 
+    async function pump(): Promise<void> {
+      for (;;) {
+        const job = wanted;
+        wanted = null;
+        if (!job || disposed) break;
+        try {
+          await sync(job.reason, job.force);
+        } catch {
+          // One bad run must never kill the pump.
+        }
+      }
+    }
+
     function schedule(reason: string, force = false, preempt = false): Promise<void> {
+      if (disposed) return Promise.resolve();
       if (preempt) flight?.abort();
-      tail = tail.then(() => sync(reason, force)).catch(() => undefined);
-      return tail;
+      wanted = {
+        reason,
+        force: (wanted?.force || force) ?? force,
+      };
+      if (!worker) {
+        worker = pump().finally(() => {
+          worker = null;
+        });
+      }
+      return worker;
     }
 
     // Startup: populate before the first `/models` call.
-    schedule("startup", true);
-    await tail;
+    await schedule("startup", true);
 
     const pollTimer = setInterval(() => {
       void schedule("poll", false);
@@ -363,22 +435,33 @@ const plugin: PluginDef = {
     // Account events: run the same sync immediately (preempting any stale
     // in-flight fetch). The key is always re-resolved inside sync, and burst
     // duplicates collapse on the `syncedKey` fast-path — no debounce needed.
+    // The loop resubscribes with backoff: a dropped event stream must never
+    // silently leave the plugin deaf (the poll would be the only trigger).
     const eventController = new AbortController();
     void (async () => {
-      try {
-        for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
-          if (disposed) return;
-          const type = event?.type as string | undefined;
-          if (type !== "integration.connection.updated" && type !== "integration.updated") continue;
-          if (type === "integration.connection.updated") {
-            const updatedID = (event.data as AnyRecord | undefined)?.integrationID
-              ?? (event.properties as AnyRecord | undefined)?.integrationID;
-            if (updatedID && updatedID !== PROVIDER_ID) continue;
+      let backoffMs = 500;
+      while (!disposed) {
+        try {
+          for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
+            if (disposed) return;
+            backoffMs = 500;
+            const type = event?.type as string | undefined;
+            if (type !== "integration.connection.updated" && type !== "integration.updated") continue;
+            if (type === "integration.connection.updated") {
+              const updatedID = (event.data as AnyRecord | undefined)?.integrationID
+                ?? (event.properties as AnyRecord | undefined)?.integrationID;
+              if (updatedID && updatedID !== PROVIDER_ID) continue;
+            }
+            trace(`event type=${type}`);
+            void schedule("event", false, true);
           }
-          void schedule("event", false, true);
+          return;
+        } catch {
+          if (disposed || eventController.signal.aborted) return;
+          trace(`event-loop broken, resubscribe in ${backoffMs}ms`);
+          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          backoffMs = Math.min(backoffMs * 2, 10_000);
         }
-      } catch {
-        return;
       }
     })();
 

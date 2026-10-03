@@ -42,7 +42,7 @@ opencode
   "plugins": [
     {
       "package": "@rurout/opencode-v2@latest",
-      "options": { "baseURL": "https://your-gateway.example.com:9443/v1" }
+      "options": { "baseURL": "https://rurout.ru/v1" }
     }
   ]
 }

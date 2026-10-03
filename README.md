@@ -1,6 +1,6 @@
 # @rurout/opencode-v2
 
-OpenCode **2.x** provider plugin for [RuRout](https://rurout.online) — your gateway key becomes a first-class provider in `/models`.
+OpenCode **2.x** provider plugin for [RuRout](https://rurout.ru) — your gateway key becomes a first-class provider in `/models`.
 
 > For OpenCode **1.x**, use [@rurout/opencode-v1](https://www.npmjs.com/package/@rurout/opencode-v1) instead
 > ([source](https://github.com/abboltuz/opencode-rurout-v1)).
@@ -49,8 +49,12 @@ opencode
 
 Or `export RUROUT_BASE_URL=...`.
 
+By default the plugin uses `https://rurout.ru/v1`. Existing installations
+configured with `https://rurout.online:9443/v1` can keep that address; an
+explicit `baseURL` or `RUROUT_BASE_URL` takes precedence over the default.
+
 ## How it works
 
-1. `setup` registers the `rurout` integration (`env` + `key` methods) so `/connect rurout` appears.
-2. The provider shell is registered in the catalog with `@opencode/ai/providers/openai-compatible` and the configured `baseURL`.
-3. Models are fetched live from `{baseURL}/models` with the client's key and written into the catalog — the same mechanism built-in dynamic providers use. Each key sees only its own allowlist; provider `settings` (`apiKey` + `baseURL`) travel with the catalog so requests authenticate.
+1. `setup` registers the `rurout` integration (`key` method) so `/connect rurout` appears.
+2. The provider shell is registered in the provider registry with `@opencode/ai/providers/openai-compatible` and the configured `baseURL`.
+3. Models are fetched live from `{baseURL}/models` with the client's key and published into the registry via `models.set` + `reload()` — the same mechanism built-in dynamic providers use. Each key sees only its own allowlist; provider `settings` (`apiKey` + `baseURL`) travel with the registry so requests authenticate. Requires OpenCode 2.x (tested with 2.0.22, `@opencode/plugin` 2.0.22 API).

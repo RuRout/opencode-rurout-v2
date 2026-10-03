@@ -58,6 +58,7 @@ const TABLE: Record<string, FallbackSpec> = {
   "gpt-image-2": spec(131072, 32000, 5, 10),
   "gpt-image-2.5-flare": spec(131072, 32000, 5, 10),
   "gpt-image-2.5-sunburst": spec(131072, 32000, 5, 10),
+  "dall-e-3": spec(32768, 8192, 5, 40),
 };
 
 const SUFFIX = /-(thinking|preview|high|medium|low|tiered)$/;
@@ -88,7 +89,9 @@ export function familyOf(id: string): string {
 }
 
 export function isReasoning(id: string): boolean {
-  return id.includes("thinking");
+  const model = stripEffortSuffix(id).replace(/-thinking$/i, "");
+  return /^(claude-(opus|sonnet)-|gemini-(2\.5-(pro|flash)|3|3\.1-pro)|gpt-(5|6|oss)|o[134])/i.test(model)
+    || id.includes("thinking");
 }
 
 export function effortSuffix(id: string): string | undefined {
@@ -126,7 +129,20 @@ export function modelLabel(canonical: string): string {
 }
 
 export function isImage(id: string): boolean {
-  return id.includes("image");
+  return id.includes("image") || id.startsWith("dall-e");
+}
+
+export function supportsVision(id: string): boolean {
+  // Pure image generation output models don't take general vision prompts in normal chat
+  if (id.startsWith("gpt-image-") || id.startsWith("dall-e-")) {
+    return false;
+  }
+  // Modern frontier families support vision input (Claude 3+, GPT-4/5/6+, Gemini, etc.)
+  if (id.startsWith("claude-") || id.startsWith("gpt-") || id.startsWith("gemini-") || id.startsWith("o1") || id.startsWith("o3") || id.startsWith("o4")) {
+    return true;
+  }
+  // By default, if the model has image in the name (e.g. multimodal models), allow vision
+  return isImage(id);
 }
 
 export function displayName(id: string, display?: string): string {

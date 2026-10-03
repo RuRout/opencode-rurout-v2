@@ -1,6 +1,6 @@
 {
   "name": "@rurout/opencode-v2",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "OpenCode 2.x provider plugin for RuRout — live model discovery from your gateway key.",
   "author": "rurout",
   "keywords": [
@@ -34,10 +34,9 @@
     "build": "tsc",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {
-    "@opencode-ai/plugin": "0.0.0-next-17444"
-  },
+  "dependencies": {},
   "devDependencies": {
+    "@opencode/plugin": "2.0.22",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3"
   }

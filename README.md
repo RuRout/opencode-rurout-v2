@@ -1,9 +1,8 @@
-# @rurout/opencode-v2
+# RuRout for OpenCode 2.x
 
 OpenCode **2.x** provider plugin for [RuRout](https://rurout.ru) — your gateway key becomes a first-class provider in `/models`.
 
-> For OpenCode **1.x**, use [@rurout/opencode-v1](https://www.npmjs.com/package/@rurout/opencode-v1) instead
-> ([source](https://github.com/abboltuz/opencode-rurout-v1)).
+> For OpenCode **1.x** see [opencode-rurout-v1](https://github.com/RuRout/opencode-rurout-v1).
 
 ## What the client gets
 
@@ -15,9 +14,14 @@ OpenCode **2.x** provider plugin for [RuRout](https://rurout.ru) — your gatewa
 
 ## Install (OpenCode 2.x only)
 
+```sh
+curl -fsSL https://rurout.ru/install.sh | sh -s -- --cli opencode2
 ```
-opencode plugin add @rurout/opencode-v2@latest
-```
+
+The installer downloads `rurout-opencode-v2-<version>.tar.gz` from
+`https://rurout.ru/downloads/connect/`, verifies its sha256 and unpacks it into
+`~/.config/opencode/plugins/rurout-connect`. No npm is involved. To remove it:
+`curl -fsSL https://rurout.ru/install.sh | sh -s -- --cli opencode2 --uninstall`.
 
 Then inside OpenCode:
 
@@ -36,26 +40,28 @@ opencode
 
 ## Custom gateway address
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "@rurout/opencode-v2@latest",
-      "options": { "baseURL": "https://rurout.ru/v1" }
-    }
-  ]
-}
+```sh
+export RUROUT_BASE_URL=https://rurout.ru/v1
 ```
-
-Or `export RUROUT_BASE_URL=...`.
 
 By default the plugin uses `https://rurout.ru/v1`. Existing installations
 configured with `https://rurout.online:9443/v1` can keep that address; an
-explicit `baseURL` or `RUROUT_BASE_URL` takes precedence over the default.
+explicit `RUROUT_BASE_URL` takes precedence over the default.
 
 ## How it works
 
 1. `setup` registers the `rurout` integration (`key` method) so `/connect rurout` appears.
 2. The provider shell is registered in the provider registry with `@opencode/ai/providers/openai-compatible` and the configured `baseURL`.
 3. Models are fetched live from `{baseURL}/models` with the client's key and published into the registry via `models.set` + `reload()` — the same mechanism built-in dynamic providers use. Each key sees only its own allowlist; provider `settings` (`apiKey` + `baseURL`) travel with the registry so requests authenticate. Requires OpenCode 2.x (tested with 2.0.22, `@opencode/plugin` 2.0.22 API).
+
+## Build the release archive
+
+```sh
+npm ci && npm run build
+npm run release:pack   # writes release/rurout-opencode-v2-<version>.tar.gz and prints its sha256
+npm run release:test   # builds twice and fails if the sha256 differs
+```
+
+The archive is deterministic (sorted names, fixed mtime/owner/mode, `gzip -n`),
+so the same commit and toolchain always give the same sha256. That sha256 is
+pinned in `install.sh` on rurout.ru.

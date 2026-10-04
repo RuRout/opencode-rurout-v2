@@ -21,7 +21,7 @@ jobs:
         run: npm ci
       - name: Typecheck and build
         run: npm run build
-      - name: Verify published package contents
-        run: npm pack --dry-run
+      - name: Build the release archive and check it is reproducible
+        run: npm run release:test
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high

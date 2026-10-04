@@ -39,6 +39,19 @@ function credentialKey(credential: AnyRecord | undefined): string {
 }
 
 /**
+ * Keys pasted into /connect or exported in a shell often carry a trailing
+ * newline or space. Normalize once so requests, the per-key model cache hash
+ * and key-change detection all see the same value.
+ */
+function normalizeKey(value: string | undefined): string {
+  return (value ?? "").trim();
+}
+
+function envKey(name?: string): string {
+  return (name ? normalizeKey(process.env[name]) : "") || normalizeKey(process.env.RUROUT_API_KEY);
+}
+
+/**
  * Single source of truth for "which key is active right now".
  * Always resolved fresh — never trusted from event payloads (the
  * connection events only carry `{ integrationID }`, no key material),
@@ -52,22 +65,19 @@ async function getActive(ctx: Plugin.Context): Promise<{
     const connection = (await ctx.integration.connection.active(
       PROVIDER_ID,
     )) as AnyRecord | undefined;
-    if (!connection) return { key: process.env.RUROUT_API_KEY ?? "", connection: undefined };
+    if (!connection) return { key: envKey(), connection: undefined };
     if (connection.type === "env" && typeof connection.name === "string") {
-      return {
-        key: process.env[connection.name] ?? process.env.RUROUT_API_KEY ?? "",
-        connection,
-      };
+      return { key: envKey(connection.name), connection };
     }
     const credential = (await ctx.integration.connection.resolve(
       connection as never,
     )) as AnyRecord | undefined;
     return {
-      key: credentialKey(credential) || process.env.RUROUT_API_KEY || "",
+      key: normalizeKey(credentialKey(credential)) || envKey(),
       connection,
     };
   } catch {
-    return { key: process.env.RUROUT_API_KEY ?? "", connection: undefined };
+    return { key: envKey(), connection: undefined };
   }
 }
 

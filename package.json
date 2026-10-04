@@ -1,6 +1,7 @@
 {
   "name": "@rurout/opencode-v2",
-  "version": "0.3.0",
+  "version": "0.3.1",
+  "private": true,
   "description": "OpenCode 2.x provider plugin for RuRout — live model discovery from your gateway key.",
   "author": "rurout",
   "keywords": [
@@ -13,7 +14,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/abboltuz/opencode-rurout-v2.git"
+    "url": "git+https://github.com/RuRout/opencode-rurout-v2.git"
   },
   "license": "MIT",
   "type": "module",
@@ -25,14 +26,10 @@
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "release:pack": "sh scripts/pack.sh",
+    "release:test": "sh scripts/test-pack.sh"
   },
   "dependencies": {},
   "devDependencies": {

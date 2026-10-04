@@ -1,11 +1,11 @@
 import type { Plugin } from "@opencode/plugin";
 import {
-  DEFAULT_BASE_URL,
+  DEFAULT_BASE_URLS,
   PROVIDER_ID,
   PROVIDER_NAME,
   PROVIDER_PACKAGE,
 } from "./constants.js";
-import { fetchGatewayModels, type GatewayModel } from "./discovery.js";
+import { fetchGatewayModelsFrom, isAuthError, type GatewayModel } from "./discovery.js";
 import {
   keyFingerprint,
   purgeLegacyFileCache,
@@ -24,9 +24,14 @@ interface RuroutOptions {
 
 type AnyRecord = Record<string, any>;
 
-function baseURLFrom(opts: RuroutOptions): string {
-  const raw = opts.baseURL ?? process.env.RUROUT_BASE_URL ?? DEFAULT_BASE_URL;
-  return raw.replace(/\/$/, "");
+/**
+ * An explicit address (plugin option or RUROUT_BASE_URL) is used as-is, with
+ * no failover. Without one, the default domains are tried in order.
+ */
+function baseURLsFrom(opts: RuroutOptions): string[] {
+  const explicit = opts.baseURL ?? process.env.RUROUT_BASE_URL;
+  if (explicit) return [explicit.replace(/\/$/, "")];
+  return DEFAULT_BASE_URLS;
 }
 
 function credentialKey(credential: AnyRecord | undefined): string {
@@ -83,11 +88,6 @@ async function getActive(ctx: Plugin.Context): Promise<{
 
 async function getActiveKey(ctx: Plugin.Context): Promise<string> {
   return (await getActive(ctx)).key;
-}
-
-function isAuthError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /rejected|invalid or disabled/i.test(msg);
 }
 
 function toModel(
@@ -279,7 +279,10 @@ const plugin = {
   id: "rurout",
   setup: async (ctx: Plugin.Context) => {
     const opts = ((ctx as AnyRecord).options ?? {}) as RuroutOptions;
-    const baseURL = baseURLFrom(opts);
+    const baseURLs = baseURLsFrom(opts);
+    // Switches to whichever address answered the last discovery, so chat and
+    // image requests use the same domain that is known to be reachable.
+    let baseURL = baseURLs[0];
 
     let disposed = false;
 
@@ -543,8 +546,9 @@ const plugin = {
       flight = ctrl;
       flightKey = key;
       let live: GatewayModel[];
+      let reachable: string;
       try {
-        live = await fetchGatewayModels(baseURL, key, 3, ctrl.signal);
+        ({ baseURL: reachable, models: live } = await fetchGatewayModelsFrom(baseURLs, key, ctrl.signal));
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
           trace(`sync reason=${reason} key=${shortHash(key)} superseded`);
@@ -582,6 +586,8 @@ const plugin = {
         return;
       }
 
+      if (reachable !== baseURL) trace(`gateway address switched to ${reachable}`);
+      baseURL = reachable;
       const models = buildModels(live);
       remember(key, models);
       void writeModelCache(key, models);

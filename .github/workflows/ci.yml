@@ -21,6 +21,8 @@ jobs:
         run: npm ci
       - name: Typecheck and build
         run: npm run build
+      - name: Unit tests
+        run: npm test
       - name: Build the release archive and check it is reproducible
         run: npm run release:test
       - name: Audit production dependencies

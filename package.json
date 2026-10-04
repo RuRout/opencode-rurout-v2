@@ -1,6 +1,6 @@
 {
   "name": "@rurout/opencode-v2",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "OpenCode 2.x provider plugin for RuRout — live model discovery from your gateway key.",
   "author": "rurout",
@@ -28,6 +28,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
+    "test": "node --test test/*.test.mjs",
     "release:pack": "sh scripts/pack.sh",
     "release:test": "sh scripts/test-pack.sh"
   },

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { scryptSync } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,9 @@ export const LEGACY_FILE_CACHE_DIR = join(homedir(), ".cache", "opencode-rurout"
 export const LEGACY_FILE_CACHE_PATTERN = /^models-[0-9a-f]+\.json$/i;
 
 export function keyFingerprint(apiKey: string, scope: string): string {
-  return createHash("sha256").update(JSON.stringify([scope, apiKey]), "utf8").digest("hex").slice(0, 12);
+  // This identifier persists on disk. Use a work-factor KDF rather than a fast
+  // truncated hash of a credential; endpoint scope also separates inventories.
+  return scryptSync(apiKey, `rurout-model-cache-v2:${scope}`, 32, { N: 16384, r: 8, p: 1 }).toString("hex");
 }
 
 export async function purgeLegacyFileCache(log?: (message: string) => void): Promise<number> {

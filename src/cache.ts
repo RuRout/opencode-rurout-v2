@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { scryptSync } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -6,8 +6,10 @@ import { join } from "node:path";
 export const LEGACY_FILE_CACHE_DIR = join(homedir(), ".cache", "opencode-rurout");
 export const LEGACY_FILE_CACHE_PATTERN = /^models-[0-9a-f]+\.json$/i;
 
-export function keyFingerprint(apiKey: string): string {
-  return createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 12);
+export function keyFingerprint(apiKey: string, scope: string): string {
+  // This identifier persists on disk. Use a work-factor KDF rather than a fast
+  // truncated hash of a credential; endpoint scope also separates inventories.
+  return scryptSync(apiKey, `rurout-model-cache-v2:${scope}`, 32, { N: 16384, r: 8, p: 1 }).toString("hex");
 }
 
 export async function purgeLegacyFileCache(log?: (message: string) => void): Promise<number> {
@@ -33,21 +35,21 @@ export async function purgeLegacyFileCache(log?: (message: string) => void): Pro
   return removed;
 }
 
-// Last-known-good model list per key hash. Only model ids/metadata live here
+// Last-known-good model list per key + endpoint configuration hash. Only model ids/metadata live here
 // (never key material), so a restart or a freshly booted location can show
 // the provider instantly instead of an empty picker while the gateway answers.
 // Always refreshed live right after it is used. Name deliberately does not
 // match LEGACY_FILE_CACHE_PATTERN, so the legacy purge leaves it alone.
 export const MODEL_CACHE_DIR = LEGACY_FILE_CACHE_DIR;
-const MODEL_CACHE_VERSION = 1;
+const MODEL_CACHE_VERSION = 2;
 
-function modelCachePath(apiKey: string): string {
-  return join(MODEL_CACHE_DIR, `v2-models-${keyFingerprint(apiKey)}.json`);
+function modelCachePath(apiKey: string, scope: string): string {
+  return join(MODEL_CACHE_DIR, `v2-models-${keyFingerprint(apiKey, scope)}.json`);
 }
 
-export async function readModelCache<T>(apiKey: string): Promise<T[] | undefined> {
+export async function readModelCache<T>(apiKey: string, scope: string): Promise<T[] | undefined> {
   try {
-    const raw = JSON.parse(await fs.readFile(modelCachePath(apiKey), "utf8")) as {
+    const raw = JSON.parse(await fs.readFile(modelCachePath(apiKey, scope), "utf8")) as {
       version?: number;
       models?: unknown;
     };
@@ -58,10 +60,10 @@ export async function readModelCache<T>(apiKey: string): Promise<T[] | undefined
   }
 }
 
-export async function writeModelCache(apiKey: string, models: unknown[]): Promise<void> {
+export async function writeModelCache(apiKey: string, scope: string, models: unknown[]): Promise<void> {
   try {
     await fs.mkdir(MODEL_CACHE_DIR, { recursive: true });
-    const target = modelCachePath(apiKey);
+    const target = modelCachePath(apiKey, scope);
     const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
     await fs.writeFile(tmp, JSON.stringify({ version: MODEL_CACHE_VERSION, models }));
     await fs.rename(tmp, target);
@@ -70,9 +72,9 @@ export async function writeModelCache(apiKey: string, models: unknown[]): Promis
   }
 }
 
-export async function removeModelCache(apiKey: string): Promise<void> {
+export async function removeModelCache(apiKey: string, scope: string): Promise<void> {
   try {
-    await fs.unlink(modelCachePath(apiKey));
+    await fs.unlink(modelCachePath(apiKey, scope));
   } catch {
     // Already gone.
   }

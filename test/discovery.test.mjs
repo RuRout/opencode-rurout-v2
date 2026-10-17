@@ -36,6 +36,18 @@ test("uses the first address when it answers", async () => {
   assert.deepEqual(calls, [`${RU}/models`]);
 });
 
+test("discovery preserves API metadata for the adapter and ignores invalid IDs", async () => {
+  const entry = {
+    id: "new/high", display_name: "Exact_name", name: "other",
+    context_window: 55555, max_input_tokens: 40000, max_output_tokens: 10000,
+    reasoning: false, supports_tools: false, input_modalities: ["audio"], output_modalities: ["text"],
+    supported_reasoning_levels: [], pricing: { currency: "USD", unit: "per_token", input_price: 0 },
+  };
+  mockFetch({ "https://rurout.ru": () => new Response(JSON.stringify({ data: [null, {}, { id: 4 }, { id: "" }, entry] })) });
+  const res = await fetchGatewayModelsFrom([RU], "k");
+  assert.deepEqual(res.models, [entry]);
+});
+
 test("fails over to the next address when the first is unreachable", async () => {
   mockFetch({ "https://rurout.ru": unreachable, "https://rurout.online": ok(["b"]) });
   const res = await fetchGatewayModelsFrom([RU, ONLINE], "k");

@@ -13,7 +13,7 @@ import {
   removeModelCache,
   writeModelCache,
 } from "./cache.js";
-import { displayName, effortSuffix, familyOf, isImage, isReasoning, lookup, stripEffortSuffix, supportsVision } from "./fallback.js";
+import { buildModels } from "./model-adapter.js";
 import { appendFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -90,92 +90,6 @@ async function getActiveKey(ctx: Plugin.Context): Promise<string> {
   return (await getActive(ctx)).key;
 }
 
-function toModel(
-  canonical: string,
-  apiId: string,
-  display: string | undefined,
-  providerID: string,
-  effort: boolean,
-): AnyRecord {
-  const fallback = lookup(canonical);
-  const image = isImage(canonical);
-  const text = !canonical.startsWith("gpt-image-") && !canonical.startsWith("dall-e-");
-  const vision = supportsVision(canonical);
-  const input = fallback.input > 0 ? fallback.input : 1;
-  const output = fallback.outputCost > 0 ? fallback.outputCost : 5;
-  return {
-    id: canonical,
-    modelID: apiId,
-    providerID,
-    name: displayName(apiId, display).startsWith("RuRout")
-      ? displayName(apiId, display)
-      : `RuRout ${displayName(apiId, display)}`,
-    family: familyOf(canonical),
-    capabilities: {
-      tools: !image && text,
-      input: vision ? ["text", "image"] : ["text"],
-      output: image || !text ? ["image"] : ["text"],
-    },
-    variants: effort || isReasoning(apiId)
-      ? [
-          { id: "low", settings: { reasoningEffort: "low" } },
-          { id: "medium", settings: { reasoningEffort: "medium" } },
-          { id: "high", settings: { reasoningEffort: "high" } },
-        ]
-      : [],
-    time: { released: 0 },
-    cost: [
-      {
-        input,
-        output,
-        cache: { read: fallback.cacheRead ?? 0, write: 0 },
-      },
-    ],
-    status: "active",
-    enabled: true,
-    limit: { context: fallback.context, output: fallback.output },
-    settings: { reasoning: isReasoning(apiId) },
-  };
-}
-
-function pickTransport(ids: string[]): string {
-  const rank = (id: string): number => {
-    const suffix = effortSuffix(id);
-    if (suffix === "tiered") return 0;
-    if (suffix === "high") return 1;
-    if (!suffix) return 2;
-    if (suffix === "medium") return 3;
-    if (suffix === "low") return 4;
-    return 5;
-  };
-  return [...ids].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : 1))[0]!;
-}
-
-function buildModels(live: GatewayModel[]): AnyRecord[] {
-  const byId = new Map(live.map((model) => [model.id, model]));
-  const groups = new Map<string, GatewayModel[]>();
-  for (const entry of byId.values()) {
-    const suffix = effortSuffix(entry.id);
-    const base = suffix ? stripEffortSuffix(entry.id) : entry.id;
-    const group = groups.get(base) ?? [];
-    group.push(entry);
-    groups.set(base, group);
-  }
-  const models: AnyRecord[] = [];
-  for (const [base, entries] of groups) {
-    const family = entries.length > 1 || entries.some((entry) => effortSuffix(entry.id));
-    if (!family) {
-      const entry = entries[0]!;
-      models.push(toModel(entry.id, entry.id, entry.display_name, PROVIDER_ID, false));
-      continue;
-    }
-    const transport = pickTransport(entries.map((entry) => entry.id));
-    const transportEntry = byId.get(transport);
-    models.push(toModel(base, transport, transportEntry?.display_name, PROVIDER_ID, true));
-  }
-  return models;
-}
-
 // ─── Single-path key sync ────────────────────────────────────────────────────
 // One rule for every trigger (startup, account event, poll, hourly, pre-request):
 //   key selected → models rebuilt from scratch for THAT key, atomically.
@@ -202,7 +116,7 @@ const PER_KEY_CACHE_LIMIT = 20;
 const TRACE_PATH = join(tmpdir(), "rurout-sync.log");
 const TRACE_MAX_BYTES = 200_000;
 
-// Append-only debug trace (no key material — hashes only). Proves which sync
+// Append-only debug trace (no key material, key hashes or remote error text). Proves which sync
 // ran, what it decided, and why. Capped so it can stay on permanently.
 function trace(msg: string): void {
   const line = `${new Date().toISOString()} ${msg}\n`;
@@ -225,22 +139,14 @@ function trace(msg: string): void {
   })();
 }
 
-function errText(err: unknown): string {
-  return (err instanceof Error ? err.message : String(err)).slice(0, 160);
-}
-
-function shortHash(key: string): string {
-  return key ? keyFingerprint(key).slice(0, 8) : "(none)";
-}
-
-// Last-known-good models per key hash, shared by every plugin instance in this
+// Last-known-good models per key + endpoint scope hash, shared by every plugin instance in this
 // process (OpenCode boots one instance per location/directory). Lets a fresh
 // location or a repeated account switch render instantly from memory.
 // Model ids are not secrets; keyed by hash so raw keys never linger here.
 const perKeyModels = new Map<string, AnyRecord[]>();
 
-function remember(key: string, models: AnyRecord[]): void {
-  const hash = keyFingerprint(key);
+function remember(key: string, scope: string, models: AnyRecord[]): void {
+  const hash = keyFingerprint(key, scope);
   perKeyModels.delete(hash);
   perKeyModels.set(hash, models);
   while (perKeyModels.size > PER_KEY_CACHE_LIMIT) {
@@ -250,18 +156,18 @@ function remember(key: string, models: AnyRecord[]): void {
   }
 }
 
-function forget(key: string): void {
-  perKeyModels.delete(keyFingerprint(key));
-  void removeModelCache(key);
+function forget(key: string, scope: string): void {
+  perKeyModels.delete(keyFingerprint(key, scope));
+  void removeModelCache(key, scope);
 }
 
-async function cachedModels(key: string): Promise<AnyRecord[] | undefined> {
+async function cachedModels(key: string, scope: string): Promise<AnyRecord[] | undefined> {
   if (!key) return undefined;
-  const memory = perKeyModels.get(keyFingerprint(key));
+  const memory = perKeyModels.get(keyFingerprint(key, scope));
   if (memory) return memory;
-  const disk = await readModelCache<AnyRecord>(key);
+  const disk = await readModelCache<AnyRecord>(key, scope);
   if (disk && disk.length > 0) {
-    remember(key, disk);
+    remember(key, scope, disk);
     return disk;
   }
   return undefined;
@@ -280,6 +186,7 @@ const plugin = {
   setup: async (ctx: Plugin.Context) => {
     const opts = ((ctx as AnyRecord).options ?? {}) as RuroutOptions;
     const baseURLs = baseURLsFrom(opts);
+    const cacheScope = JSON.stringify(baseURLs);
     // Switches to whichever address answered the last discovery, so chat and
     // image requests use the same domain that is known to be reachable.
     let baseURL = baseURLs[0];
@@ -335,16 +242,16 @@ const plugin = {
           integrationID: PROVIDER_ID,
           method: { type: "key", label: "API Key" },
         });
-      } catch (err) {
-        trace(`integration transform failed: ${errText(err)}`);
+      } catch {
+        trace("integration transform failed");
       }
     });
 
     await ctx.provider.transform((editor: any) => {
       try {
         applyProvider(editor);
-      } catch (err) {
-        trace(`provider transform failed: ${errText(err)}`);
+      } catch {
+        trace("provider transform failed");
       }
     });
 
@@ -376,12 +283,12 @@ const plugin = {
         await ctx.tool.transform((editor: any) => {
           try {
             addImageTool(editor);
-          } catch (err) {
-            trace(`tool transform failed: ${errText(err)}`);
+          } catch {
+            trace("tool transform failed");
           }
         });
-      } catch (toolErr) {
-        trace(`failed to register generate_image tool: ${toolErr}`);
+      } catch {
+        trace("failed to register generate_image tool");
       }
     }
 
@@ -495,6 +402,9 @@ const plugin = {
     // Last key fully written to the registry (with its own models, or an empty
     // list for a rejected key). `undefined` = never synced since startup.
     let syncedKey: string | undefined;
+    // A failed refresh of an already-synced key must remain due: otherwise
+    // the 5s poll's fast-path would postpone retries until the next hour.
+    let refreshNeeded = false;
     // Coalescing single-flight: at most one sync runs, at most one waits.
     // Burst triggers merge into the waiting slot instead of piling full
     // fetches behind each other (a slow gateway + 5s poll used to grow an
@@ -516,8 +426,8 @@ const plugin = {
       const startedAt = Date.now();
       const { key, connection } = await getActive(ctx);
       if (disposed) return;
-      if (!force && key === syncedKey) {
-        trace(`sync reason=${reason} key=${shortHash(key)} noop already-synced`);
+      if (!force && !refreshNeeded && key === syncedKey) {
+        trace(`sync reason=${reason} noop already-synced`);
         return;
       }
 
@@ -525,20 +435,21 @@ const plugin = {
         // The key changed: never leave the previous key's models selectable.
         // Show this key's last-known list instantly when we have one,
         // otherwise wipe to empty while the fresh discovery runs.
-        const cached = await cachedModels(key);
+        const cached = await cachedModels(key, cacheScope);
         if (disposed) return;
-        trace(`sync reason=${reason} key=${shortHash(key)} changed instant=${cached ? `${cached.length}-cached` : "wipe"}`);
+        trace(`sync reason=${reason} changed instant=${cached ? `${cached.length}-cached` : "wipe"}`);
         applySource(key, connection, cached ?? []);
         await publish();
         if (disposed) return;
         // syncedKey stays untouched until the fetch below succeeds: a failed
         // fetch keeps retrying on the next trigger instead of looking "done".
       } else {
-        trace(`sync reason=${reason} key=${shortHash(key)} force-refresh`);
+        trace(`sync reason=${reason} force-refresh`);
       }
 
       if (!key) {
         syncedKey = key;
+        refreshNeeded = false;
         return;
       }
 
@@ -551,22 +462,28 @@ const plugin = {
         ({ baseURL: reachable, models: live } = await fetchGatewayModelsFrom(baseURLs, key, ctrl.signal));
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
-          trace(`sync reason=${reason} key=${shortHash(key)} superseded`);
+          trace(`sync reason=${reason} superseded`);
           return;
         }
+        // A late rejection for the old account must not clear a new account's
+        // inventory (or republish a disposed plugin).
+        const current = await getActive(ctx);
+        if (disposed || current.key !== key) return;
         if (isAuthError(err)) {
           // Rejected key: record the empty list so its (lack of) models is
           // honest and the poll fast-path stops hammering the gateway.
-          trace(`sync reason=${reason} key=${shortHash(key)} auth-rejected`);
-          forget(key);
-          applySource(key, connection, []);
+          trace(`sync reason=${reason} auth-rejected`);
+          forget(key, cacheScope);
+          applySource(key, current.connection, []);
           await publish();
           syncedKey = key;
+          refreshNeeded = false;
           return;
         }
         // Transient network failure: keep whatever the instant step wrote
         // (cached or empty) and retry on the next trigger.
-        trace(`sync reason=${reason} key=${shortHash(key)} fetch-failed ${err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120)}`);
+        refreshNeeded = true;
+        trace(`sync reason=${reason} fetch-failed`);
         return;
       } finally {
         if (flight === ctrl) {
@@ -582,19 +499,20 @@ const plugin = {
       const current = await getActive(ctx);
       if (disposed) return;
       if (current.key !== key) {
-        trace(`sync reason=${reason} key=${shortHash(key)} discarded key-moved`);
+        trace(`sync reason=${reason} discarded key-moved`);
         return;
       }
 
-      if (reachable !== baseURL) trace(`gateway address switched to ${reachable}`);
+      if (reachable !== baseURL) trace("gateway address switched");
       baseURL = reachable;
       const models = buildModels(live);
-      remember(key, models);
-      void writeModelCache(key, models);
+      remember(key, cacheScope, models);
+      void writeModelCache(key, cacheScope, models);
       applySource(key, current.connection, models);
       await publish();
       syncedKey = key;
-      trace(`sync reason=${reason} key=${shortHash(key)} done n=${models.length} ms=${Date.now() - startedAt}`);
+      refreshNeeded = false;
+      trace(`sync reason=${reason} done n=${models.length} ms=${Date.now() - startedAt}`);
       await purgeLegacyFileCache();
     }
 
@@ -655,7 +573,7 @@ const plugin = {
     // the very first `/models` call is not empty.
     const startup = schedule("startup", true);
     const startKey = await getActiveKey(ctx);
-    if (!(await cachedModels(startKey))) {
+    if (!(await cachedModels(startKey, cacheScope))) {
       await Promise.race([
         startup,
         new Promise((resolve) => setTimeout(resolve, STARTUP_WAIT_MS)),
@@ -678,7 +596,8 @@ const plugin = {
 
     // Account events: run the same sync immediately (preempting any stale
     // in-flight fetch). The key is always re-resolved inside sync, and burst
-    // duplicates collapse on the `syncedKey` fast-path — no debounce needed.
+    // duplicates coalesce in the queue. Explicit events also refresh metadata
+    // for the same key, without requiring a restart or waiting for the hour.
     // The loop resubscribes with backoff: a dropped event stream must never
     // silently leave the plugin deaf (the poll would be the only trigger).
     const eventController = new AbortController();
@@ -696,8 +615,8 @@ const plugin = {
             const updatedID = (event as AnyRecord).data?.integrationID
               ?? (event as AnyRecord).properties?.integrationID;
             if (updatedID && updatedID !== PROVIDER_ID) continue;
-            trace(`event type=${type}`);
-            void schedule("event", false, true);
+            trace("account event");
+            void schedule("event", true, true);
           }
           return;
         } catch {

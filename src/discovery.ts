@@ -4,7 +4,19 @@ const AUTH_ERROR_PREFIX = "gateway rejected the API key";
 
 export interface GatewayModel {
   id: string;
-  display_name?: string;
+  // Optional metadata crosses an untrusted JSON boundary; the adapter validates
+  // each field independently before using it instead of its legacy fallback.
+  display_name?: unknown;
+  name?: unknown;
+  context_window?: unknown;
+  max_input_tokens?: unknown;
+  max_output_tokens?: unknown;
+  reasoning?: unknown;
+  supports_tools?: unknown;
+  input_modalities?: unknown;
+  output_modalities?: unknown;
+  supported_reasoning_levels?: unknown;
+  pricing?: unknown;
   created_at?: string;
 }
 
@@ -42,8 +54,8 @@ export async function fetchGatewayModels(
       await sleep(300 * (attempt + 1));
       continue;
     }
-    const body = (await response.json()) as { data?: GatewayModel[] };
-    const list = Array.isArray(body.data) ? body.data : [];
+    const body = (await response.json()) as { data?: GatewayModel[] } | null;
+    const list = Array.isArray(body?.data) ? body.data : [];
     const models = list.filter((m) => typeof m?.id === "string" && m.id.length > 0);
     return models;
   }

@@ -68,14 +68,13 @@ const SUFFIX = /-(thinking|preview|high|medium|low|tiered)$/;
 const DATE = /-\d{8}$/;
 
 export function lookup(id: string): FallbackSpec {
-  const direct = TABLE[id];
-  if (direct) return direct;
+  if (Object.prototype.hasOwnProperty.call(TABLE, id)) return TABLE[id]!;
   const noSuffix = id.replace(SUFFIX, "");
-  if (TABLE[noSuffix]) return TABLE[noSuffix];
+  if (Object.prototype.hasOwnProperty.call(TABLE, noSuffix)) return TABLE[noSuffix]!;
   const noDate = id.replace(DATE, "");
-  if (TABLE[noDate]) return TABLE[noDate];
+  if (Object.prototype.hasOwnProperty.call(TABLE, noDate)) return TABLE[noDate]!;
   const noBoth = noSuffix.replace(DATE, "");
-  if (TABLE[noBoth]) return TABLE[noBoth];
+  if (Object.prototype.hasOwnProperty.call(TABLE, noBoth)) return TABLE[noBoth]!;
   return {
     context: FALLBACK_CONTEXT,
     output: FALLBACK_OUTPUT,

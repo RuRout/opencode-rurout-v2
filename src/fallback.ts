@@ -90,10 +90,40 @@ export function familyOf(id: string): string {
   return "RuRout";
 }
 
+// Official API values, from sub2api docs/RUROUT_MODEL_CATALOG_POLICY.md. Models
+// without a public specification stay out, so they get no made-up levels.
+const NONE_TO_MAX = ["none", "low", "medium", "high", "xhigh", "max"];
+const LOW_TO_MAX = ["low", "medium", "high", "xhigh", "max"];
+const LOW_TO_XHIGH = ["low", "medium", "high", "xhigh"];
+const EFFORT_LEVELS: Array<[RegExp, string[]]> = [
+  [/^gpt-5\.6-(sol|terra|luna)$/, NONE_TO_MAX],
+  [/^gpt-6-(sol|luna)$/, NONE_TO_MAX],
+  [/^(gpt-6-astra|gpt-6\.1-sol)$/, LOW_TO_MAX],
+  [/^grok-4\.[67]$/, LOW_TO_XHIGH],
+  [/^grok-4\.5$/, ["low", "medium", "high"]],
+  [/^grok-4\.3$/, ["none", "low", "medium", "high", "xhigh"]],
+  [/^grok-4\.20-multi-agent-0309$/, LOW_TO_XHIGH],
+  [/^claude-opus-(4-[7-9]|[5-9](-\d+)?)$/, LOW_TO_MAX],
+  [/^claude-(sonnet|fable)-[5-9](-\d+)?$/, LOW_TO_MAX],
+  [/^claude-haiku-5-5$/, LOW_TO_MAX],
+  [/^claude-(opus|sonnet)-4-6$/, ["low", "medium", "high", "max"]],
+];
+
+/** Effort levels of a known model; undefined means the table has no answer. */
+export function effortLevels(id: string): string[] | undefined {
+  const model = id.toLowerCase()
+    .replace(/-(high|medium|low|tiered)$/, "")
+    .replace(/-thinking$/, "")
+    .replace(DATE, "");
+  const levels = EFFORT_LEVELS.find(([pattern]) => pattern.test(model))?.[1];
+  return levels ? [...levels] : undefined;
+}
+
 export function isReasoning(id: string): boolean {
   const model = stripEffortSuffix(id).replace(/-thinking$/i, "");
   return /^(claude-(opus|sonnet)-|gemini-(2\.5-(pro|flash)|3|3\.1-pro)|gpt-(5|6|oss)|o[134])/i.test(model)
-    || id.includes("thinking");
+    || id.includes("thinking")
+    || effortLevels(id) !== undefined;
 }
 
 export function effortSuffix(id: string): string | undefined {

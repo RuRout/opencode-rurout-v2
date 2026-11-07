@@ -211,3 +211,60 @@ test("a fresh snapshot rebuilds context and pricing even when IDs do not change"
   assert.equal(after[0].cost[0].input, 0);
   assert.notStrictEqual(before[0], after[0]);
 });
+
+const NONE_TO_MAX = ["none", "low", "medium", "high", "xhigh", "max"];
+const LOW_TO_MAX = ["low", "medium", "high", "xhigh", "max"];
+const LOW_TO_XHIGH = ["low", "medium", "high", "xhigh"];
+const OFFICIAL_LEVELS = {
+  "gpt-5.6-sol": NONE_TO_MAX,
+  "gpt-5.6-terra": NONE_TO_MAX,
+  "gpt-5.6-luna": NONE_TO_MAX,
+  "gpt-6-sol": NONE_TO_MAX,
+  "gpt-6-luna": NONE_TO_MAX,
+  "gpt-6-astra": LOW_TO_MAX,
+  "gpt-6.1-sol": LOW_TO_MAX,
+  "grok-4.7": LOW_TO_XHIGH,
+  "grok-4.6": LOW_TO_XHIGH,
+  "grok-4.5": ["low", "medium", "high"],
+  "grok-4.3": ["none", "low", "medium", "high", "xhigh"],
+  "grok-4.20-multi-agent-0309": LOW_TO_XHIGH,
+  "claude-opus-4-7": LOW_TO_MAX,
+  "claude-opus-4-8": LOW_TO_MAX,
+  "claude-opus-5": LOW_TO_MAX,
+  "claude-opus-5-5": LOW_TO_MAX,
+  "claude-opus-4-7-20260416": LOW_TO_MAX,
+  "claude-sonnet-5": LOW_TO_MAX,
+  "claude-sonnet-5-5": LOW_TO_MAX,
+  "claude-haiku-5-5": LOW_TO_MAX,
+  "claude-fable-5": LOW_TO_MAX,
+  "claude-fable-5-1": LOW_TO_MAX,
+  "claude-opus-4-6": ["low", "medium", "high", "max"],
+  "claude-sonnet-4-6": ["low", "medium", "high", "max"],
+  "claude-sonnet-4-6-thinking": ["low", "medium", "high", "max"],
+};
+
+test("known models offer exactly their official effort levels", () => {
+  for (const [id, levels] of Object.entries(OFFICIAL_LEVELS)) {
+    const model = toModel({ id });
+    assert.equal(model.settings.reasoning, true, id);
+    assert.deepEqual(model.variants, levels.map((level) => ({ id: level, settings: { reasoningEffort: level } })), id);
+  }
+});
+
+test("models without a public effort specification get no variants", () => {
+  for (const id of ["grok-4.7-build-fast", "gpt-reserve", "codex-auto-review", "grok-imagine-image", "claude-haiku-4-5"]) {
+    const model = toModel({ id });
+    assert.equal(model.settings.reasoning, false, id);
+    assert.deepEqual(model.variants, [], id);
+  }
+});
+
+test("the effort table neither overrides the API nor changes models outside it", () => {
+  assert.deepEqual(toModel({ id: "grok-4.7", reasoning: false }).variants, []);
+  assert.deepEqual(toModel({ id: "grok-4.7", supported_reasoning_levels: [] }).variants, []);
+  assert.deepEqual(toModel({ id: "gpt-6-sol", supported_reasoning_levels: ["high"] }).variants.map((v) => v.id), ["high"]);
+  assert.deepEqual(toModel({ id: "grok-4.7", supported_reasoning_levels: "high" }).variants.map((v) => v.id), LOW_TO_XHIGH);
+  for (const id of ["gpt-5.5", "claude-opus-4-5", "claude-sonnet-4-5", "gemini-3.1-pro"]) {
+    assert.deepEqual(toModel({ id }).variants.map((v) => v.id), ["low", "medium", "high"], id);
+  }
+});

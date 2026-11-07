@@ -1,6 +1,6 @@
 import { PROVIDER_ID } from "./constants.js";
 import type { GatewayModel } from "./discovery.js";
-import { displayName, effortSuffix, familyOf, isImage, isReasoning, lookup, supportsVision } from "./fallback.js";
+import { displayName, effortLevels, effortSuffix, familyOf, isImage, isReasoning, lookup, supportsVision } from "./fallback.js";
 
 function tokenLimit(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
@@ -51,7 +51,7 @@ export function toModel(entry: GatewayModel) {
   // strings or booleans into numbers. Zero is a valid API price.
   const validPricing = pricing?.currency === "USD" && pricing?.unit === "per_token" ? pricing : undefined;
   const levels = entry.reasoning === false ? [] : strings(entry.supported_reasoning_levels)
-    ?? (reasoning || effortSuffix(id) ? ["low", "medium", "high"] : []);
+    ?? effortLevels(id) ?? (reasoning || effortSuffix(id) ? ["low", "medium", "high"] : []);
   const context = tokenLimit(entry.context_window) ?? fallback.context;
   const inputLimit = tokenLimit(entry.max_input_tokens);
   return {

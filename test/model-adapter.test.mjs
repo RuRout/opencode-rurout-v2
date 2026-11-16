@@ -36,11 +36,11 @@ test("arbitrary new API IDs use all supplied metadata and per-token USD prices",
 test("partial metadata falls back independently, not as a whole model", () => {
   const fallback = lookup("claude-sonnet-4-6");
   const model = toModel({
-    id: "claude-sonnet-4-6", max_input_tokens: 12345, context_window: 77777,
+    id: "claude-sonnet-4-6", max_input_tokens: 12345, context_window: 777777,
     input_modalities: ["audio"],
     pricing: { currency: "USD", unit: "per_token", output_price: 0.000002 },
   });
-  assert.deepEqual(model.limit, { context: 77777, input: 12345, output: fallback.output });
+  assert.deepEqual(model.limit, { context: 777777, input: 12345, output: fallback.output });
   assert.deepEqual(model.capabilities, { tools: true, input: ["audio"], output: ["text"] });
   assert.deepEqual(model.cost, [{ input: fallback.input, output: 2, cache: { read: fallback.cacheRead, write: 0 } }]);
   assert.equal(model.settings.reasoning, true);
@@ -210,4 +210,22 @@ test("a fresh snapshot rebuilds context and pricing even when IDs do not change"
   assert.equal(after[0].limit.context, 8000);
   assert.equal(after[0].cost[0].input, 0);
   assert.notStrictEqual(before[0], after[0]);
+});
+
+test("current Claude models without API limits get their 1M window, not the 200K default", () => {
+  // Regression: these IDs were missing from the table, so OpenCode showed and
+  // compacted at the 200K unknown-model default while the gateway serves 1M.
+  for (const id of [
+    "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5", "claude-opus-5-5",
+    "claude-sonnet-4-6", "claude-sonnet-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+    "claude-fable-5", "claude-fable-5-1", "claude-fable-5-2", "claude-opus-5-5-thinking",
+  ]) {
+    assert.deepEqual(toModel({ id }).limit, { context: 1000000, output: 128000 }, id);
+  }
+  assert.deepEqual(toModel({ id: "claude-opus-5-5" }).cost, [{ input: 4, output: 20, cache: { read: 0.2, write: 0 } }]);
+  assert.deepEqual(toModel({ id: "claude-fable-5-2" }).cost, [{ input: 8, output: 40, cache: { read: 0.2, write: 0 } }]);
+  // API-supplied limits still win over the table.
+  assert.deepEqual(toModel({ id: "claude-opus-5-5", context_window: 300000, max_output_tokens: 64000 }).limit,
+    { context: 300000, output: 64000 });
+  assert.deepEqual(toModel({ id: "claude-haiku-4-5-20251001" }).limit, { context: 200000, output: 64000 });
 });

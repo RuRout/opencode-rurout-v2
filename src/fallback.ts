@@ -22,11 +22,23 @@ function spec(
 // Suffix-stripped variants (thinking/preview/high/medium/low/tiered/dates)
 // resolve to the base entry in `lookup`.
 const TABLE: Record<string, FallbackSpec> = {
+  // Claude limits and list prices: platform.claude.com/docs/en/models/overview
+  // (checked 2026-11-16), the same figures the gateway seeds for its model list.
   "claude-haiku-4-5": spec(200000, 64000, 1, 5, 0.1),
+  "claude-haiku-5-5": spec(1000000, 128000, 0.1, 0.5, 0.01),
   "claude-opus-4-5": spec(200000, 64000, 5, 25, 0.5),
   "claude-opus-4-6": spec(1000000, 128000, 5, 25, 0.5),
+  "claude-opus-4-7": spec(1000000, 128000, 5, 25, 0.5),
+  "claude-opus-4-8": spec(1000000, 128000, 5, 25, 0.5),
+  "claude-opus-5": spec(1000000, 128000, 5, 25, 0.5),
+  "claude-opus-5-5": spec(1000000, 128000, 4, 20, 0.2),
   "claude-sonnet-4-5": spec(200000, 64000, 3, 15, 0.3),
-  "claude-sonnet-4-6": spec(1000000, 64000, 3, 15, 0.3),
+  "claude-sonnet-4-6": spec(1000000, 128000, 3, 15, 0.3),
+  "claude-sonnet-5": spec(1000000, 128000, 2, 10, 0.2),
+  "claude-sonnet-5-5": spec(1000000, 128000, 2, 10, 0.1),
+  "claude-fable-5": spec(1000000, 128000, 10, 50, 1),
+  "claude-fable-5-1": spec(1000000, 128000, 10, 50, 1),
+  "claude-fable-5-2": spec(1000000, 128000, 8, 40, 0.2),
   "gemini-2.5-flash": spec(1048576, 65535, 0.3, 2.5),
   "gemini-2.5-flash-lite": spec(1048576, 65535, 0.1, 0.4),
   "gemini-2.5-pro": spec(1048576, 65535, 1.25, 10),

@@ -36,11 +36,11 @@ test("arbitrary new API IDs use all supplied metadata and per-token USD prices",
 test("partial metadata falls back independently, not as a whole model", () => {
   const fallback = lookup("claude-sonnet-4-6");
   const model = toModel({
-    id: "claude-sonnet-4-6", max_input_tokens: 12345, context_window: 77777,
+    id: "claude-sonnet-4-6", max_input_tokens: 12345, context_window: 777777,
     input_modalities: ["audio"],
     pricing: { currency: "USD", unit: "per_token", output_price: 0.000002 },
   });
-  assert.deepEqual(model.limit, { context: 77777, input: 12345, output: fallback.output });
+  assert.deepEqual(model.limit, { context: 777777, input: 12345, output: fallback.output });
   assert.deepEqual(model.capabilities, { tools: true, input: ["audio"], output: ["text"] });
   assert.deepEqual(model.cost, [{ input: fallback.input, output: 2, cache: { read: fallback.cacheRead, write: 0 } }]);
   assert.equal(model.settings.reasoning, true);

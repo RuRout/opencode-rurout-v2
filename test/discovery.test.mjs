@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
+import { DEFAULT_BASE_URLS } from "../dist/constants.js";
 import { fetchGatewayModelsFrom } from "../dist/discovery.js";
 
+const COM = "https://rurout.com/v1";
 const RU = "https://rurout.ru/v1";
 const ONLINE = "https://rurout.online/v1";
 const realFetch = globalThis.fetch;
@@ -75,4 +77,40 @@ test("aborts propagate without trying other addresses", async () => {
 test("reports the last error when every address is unreachable", async () => {
   mockFetch({ "https://rurout.ru": unreachable, "https://rurout.online": unreachable });
   await assert.rejects(fetchGatewayModelsFrom([RU, ONLINE], "k"), /rurout\.online.*fetch failed/);
+});
+
+test("default addresses are rurout.com, then rurout.ru, then rurout.online", () => {
+  assert.deepEqual(DEFAULT_BASE_URLS, [COM, RU, ONLINE]);
+});
+
+test("defaults use the primary .com domain when it answers", async () => {
+  const calls = mockFetch({
+    "https://rurout.com": ok(["a"]),
+    "https://rurout.ru": ok(["b"]),
+    "https://rurout.online": ok(["c"]),
+  });
+  const res = await fetchGatewayModelsFrom(DEFAULT_BASE_URLS, "k");
+  assert.equal(res.baseURL, COM);
+  assert.deepEqual(calls, [`${COM}/models`]);
+});
+
+test("defaults fall through .com and .ru to .online in order", async () => {
+  const calls = mockFetch({
+    "https://rurout.com": unreachable,
+    "https://rurout.ru": unreachable,
+    "https://rurout.online": ok(["c"]),
+  });
+  const res = await fetchGatewayModelsFrom(DEFAULT_BASE_URLS, "k");
+  assert.equal(res.baseURL, ONLINE);
+  assert.deepEqual(calls, [`${COM}/models`, `${RU}/models`, `${ONLINE}/models`]);
+});
+
+test("defaults move to .ru when only .com is unreachable", async () => {
+  mockFetch({
+    "https://rurout.com": unreachable,
+    "https://rurout.ru": ok(["b"]),
+    "https://rurout.online": ok(["c"]),
+  });
+  const res = await fetchGatewayModelsFrom(DEFAULT_BASE_URLS, "k");
+  assert.equal(res.baseURL, RU);
 });

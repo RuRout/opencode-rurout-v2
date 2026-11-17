@@ -622,9 +622,8 @@ const plugin = {
 
     let probeTimer: ReturnType<typeof setInterval> | undefined;
     if (monitor) {
-      probeTimer = setInterval(() => {
-        void monitor.tick();
-      }, DOMAIN_PROBE_INTERVAL_MS);
+      // tick() never rejects; returning its promise lets tests await a cycle.
+      probeTimer = setInterval(() => monitor.tick(), DOMAIN_PROBE_INTERVAL_MS);
       (probeTimer as unknown as { unref?: () => void }).unref?.();
     }
 

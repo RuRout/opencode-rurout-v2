@@ -312,6 +312,16 @@ async function started(hosts) {
   cleanup = await plugin.setup(h.ctx);
   await until(() => h.current().models[0]?.id === "m");
   assert.equal(publishedBase(h), `https://${COM}/v1`);
+  // The startup sync keeps its worker busy a little after publishing (cache
+  // housekeeping); the monitor skips ticks meanwhile. Run healthy probe
+  // ticks until one actually executes, so tests start from an idle plugin.
+  for (let i = 0; ; i++) {
+    assert.ok(i < 2000, "plugin never became idle");
+    const seen = calls.length;
+    await timers.get(PROBE_MS)();
+    if (calls.length > seen) break;
+    await tick();
+  }
   return { h, calls, hosts };
 }
 

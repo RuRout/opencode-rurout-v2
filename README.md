@@ -45,12 +45,21 @@ opencode
 export RUROUT_BASE_URL=https://rurout.ru/v1
 ```
 
-By default the plugin tries `https://rurout.ru/v1` and, if that address is
-unreachable (for example a VPN or network blocks the domain), falls back to
-`https://rurout.online/v1`; chat and image requests then use whichever address
-answered. Existing installations configured with
-`https://rurout.online:9443/v1` can keep that address. An explicit
-`RUROUT_BASE_URL` is used as-is, without failover.
+By default the plugin tries the domains in this order: `https://rurout.com/v1`
+(primary), `https://rurout.ru/v1`, `https://rurout.online/v1` (reserves, same
+gateway). If an address is unreachable (for example a VPN or network blocks the
+domain), discovery moves on to the next one; chat and image requests then use
+whichever address answered. The address is re-checked on every discovery
+(startup, account switch, hourly refresh, and the 5-second retry after a failed
+refresh), so the plugin returns to the primary domain once it is reachable
+again.
+
+OpenCode 2.x hands the provider only serializable settings (`baseURL`,
+`apiKey`, headers), so the plugin cannot intercept individual chat requests:
+if the active domain goes down in the middle of a session, requests fail until
+the next discovery switches the address (or OpenCode is restarted). Existing
+installations configured with `https://rurout.online:9443/v1` can keep that
+address. An explicit `RUROUT_BASE_URL` is used as-is, without failover.
 
 ## How it works
 

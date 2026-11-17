@@ -4,7 +4,9 @@ import {
   PROVIDER_ID,
   PROVIDER_NAME,
   PROVIDER_PACKAGE,
+  DOMAIN_PROBE_INTERVAL_MS,
 } from "./constants.js";
+import { createDomainMonitor } from "./failover.js";
 import { fetchGatewayModelsFrom, isAuthError, type GatewayModel } from "./discovery.js";
 import {
   keyFingerprint,
@@ -516,6 +518,26 @@ const plugin = {
       await purgeLegacyFileCache();
     }
 
+    // Mid-session domain failover: only with the default domain list (an
+    // explicit address is never switched). Republishes through the same
+    // `publish()` reload that discovery uses; discovery itself stays the
+    // single place that selects the address at sync time.
+    const monitor =
+      baseURLs.length > 1
+        ? createDomainMonitor({
+            baseURLs,
+            getBase: () => baseURL,
+            getKey: () => getActiveKey(ctx),
+            busy: () => worker !== null,
+            trace,
+            setBase: async (next) => {
+              baseURL = next;
+              source.info.settings = { ...(source.info.settings ?? {}), baseURL };
+              await publish();
+            },
+          })
+        : undefined;
+
     async function pump(): Promise<void> {
       for (;;) {
         const job = wanted;
@@ -538,7 +560,11 @@ const plugin = {
 
     function schedule(reason: string, force = false, preempt = false): Promise<void> {
       if (disposed) return Promise.resolve();
-      if (preempt) void preemptStale();
+      if (preempt) {
+        void preemptStale();
+        // An account change invalidates any probe made with the old key.
+        monitor?.cancel();
+      }
       wanted = {
         reason,
         force: (wanted?.force || force) ?? force,
@@ -594,6 +620,14 @@ const plugin = {
       (hourlyTimer as unknown as { unref: () => void }).unref();
     }
 
+    let probeTimer: ReturnType<typeof setInterval> | undefined;
+    if (monitor) {
+      probeTimer = setInterval(() => {
+        void monitor.tick();
+      }, DOMAIN_PROBE_INTERVAL_MS);
+      (probeTimer as unknown as { unref?: () => void }).unref?.();
+    }
+
     // Account events: run the same sync immediately (preempting any stale
     // in-flight fetch). The key is always re-resolved inside sync, and burst
     // duplicates coalesce in the queue. Explicit events also refresh metadata
@@ -637,6 +671,8 @@ const plugin = {
       flight?.abort();
       clearInterval(pollTimer);
       clearInterval(hourlyTimer);
+      if (probeTimer !== undefined) clearInterval(probeTimer);
+      monitor?.cancel();
     };
   },
 };

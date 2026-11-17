@@ -51,15 +51,28 @@ gateway). If an address is unreachable (for example a VPN or network blocks the
 domain), discovery moves on to the next one; chat and image requests then use
 whichever address answered. The address is re-checked on every discovery
 (startup, account switch, hourly refresh, and the 5-second retry after a failed
-refresh), so the plugin returns to the primary domain once it is reachable
-again.
+refresh).
 
-OpenCode 2.x hands the provider only serializable settings (`baseURL`,
-`apiKey`, headers), so the plugin cannot intercept individual chat requests:
-if the active domain goes down in the middle of a session, requests fail until
-the next discovery switches the address (or OpenCode is restarted). Existing
-installations configured with `https://rurout.online:9443/v1` can keep that
-address. An explicit `RUROUT_BASE_URL` is used as-is, without failover.
+The active domain is also watched while OpenCode is running. OpenCode 2.x hands
+the provider only serializable settings (`baseURL`, `apiKey`, headers), so the
+plugin cannot intercept or retry individual chat requests; instead, every 30
+seconds it sends one idempotent `GET <active>/models` probe (5-second timeout,
+never more than one probe cycle at a time, nothing logged per probe). Only a
+network-level failure (DNS, refused connection, TLS/SNI reset, connect timeout)
+counts as "domain down"; an HTTP response of any status, including 4xx and 5xx,
+means the domain is reachable. When the active domain is down, the plugin tries
+the other domains in order and republishes the first reachable one as the new
+`baseURL`, so the next request already goes there. While on a reserve domain the
+plugin moves back to a higher-priority one (`.com` first) only after it answered
+two consecutive probes, so a flapping domain does not make the address bounce.
+
+In practice a failing domain costs at most one failed attempt per probe
+interval: a request sent in the window between the domain dying and the next
+probe still fails (the plugin never re-sends a client request), and requests
+after the switch succeed. Existing installations configured with
+`https://rurout.online:9443/v1` can keep that address. An explicit
+`RUROUT_BASE_URL` (or plugin `baseURL` option) is used as-is, without discovery
+failover or live switching.
 
 ## How it works
 

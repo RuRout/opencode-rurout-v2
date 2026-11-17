@@ -80,7 +80,7 @@ function harness(key, baseURL = "https://sync.invalid/v1") {
     models: { set: (_id, models) => { provider.models = models; } },
   };
   const ctx = {
-    options: { baseURL },
+    options: baseURL === null ? {} : { baseURL },
     integration: {
       transform: async () => {},
       connection: {
@@ -274,4 +274,200 @@ test("shared in-memory inventory is isolated by both endpoint and key", async ()
   const stopThird = await startingThird;
   cleanup = () => { stopFirst(); stopSecond(); stopThird(); };
   assert.equal(third.current().models[0].id, "third-private-model");
+});
+
+// --- mid-session domain failover (default domain list, no explicit baseURL) ---
+
+const PROBE_MS = 30_000;
+const COM = "rurout.com";
+const RU = "rurout.ru";
+const ONLINE = "rurout.online";
+
+// Per-host gateway behaviour: "up" answers, "down" is a network failure, a
+// number is an HTTP status, a deferred holds the request open.
+function gateway(hosts) {
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const host = new URL(url).host;
+    calls.push(host);
+    const mode = hosts[host];
+    if (mode === "down") throw new TypeError("fetch failed");
+    if (typeof mode === "number") return new Response("{}", { status: mode });
+    if (mode && typeof mode.then === "function") {
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        mode.then(resolve);
+      });
+    }
+    return ok({ id: "m" });
+  };
+  return calls;
+}
+
+const publishedBase = (h) => h.current().provider.settings.baseURL;
+
+async function started(hosts) {
+  const h = harness("failover-test-key", null);
+  const calls = gateway(hosts);
+  cleanup = await plugin.setup(h.ctx);
+  await until(() => h.current().models[0]?.id === "m");
+  assert.equal(publishedBase(h), `https://${COM}/v1`);
+  // The startup sync keeps its worker busy a little after publishing (cache
+  // housekeeping); the monitor skips ticks meanwhile. Run healthy probe
+  // ticks until one actually executes, so tests start from an idle plugin.
+  for (let i = 0; ; i++) {
+    assert.ok(i < 2000, "plugin never became idle");
+    const seen = calls.length;
+    await timers.get(PROBE_MS)();
+    if (calls.length > seen) break;
+    await tick();
+  }
+  return { h, calls, hosts };
+}
+
+test("active domain going down mid-session republishes the next reachable domain", async () => {
+  const { h, hosts } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  const before = h.snapshots.length;
+  hosts[COM] = "down";
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${RU}/v1`);
+  assert.equal(h.snapshots.length, before + 1);
+  assert.equal(h.current().provider.settings.apiKey, "failover-test-key");
+  assert.equal(h.current().models[0].id, "m");
+  hosts[RU] = "down";
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${ONLINE}/v1`);
+});
+
+test("a healthy active domain is probed without republishing", async () => {
+  const { h } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  const before = h.snapshots.length;
+  await timers.get(PROBE_MS)();
+  await timers.get(PROBE_MS)();
+  assert.equal(h.snapshots.length, before);
+});
+
+test("returns to the primary domain only after consecutive successful probes", async () => {
+  const { h, hosts } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  hosts[COM] = "down";
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${RU}/v1`);
+  hosts[COM] = "up";
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${RU}/v1`);
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${COM}/v1`);
+});
+
+test("a flapping primary domain does not make the address bounce", async () => {
+  const { h, hosts } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  hosts[COM] = "down";
+  await timers.get(PROBE_MS)();
+  const before = h.snapshots.length;
+  for (const state of ["up", "down", "up", "down"]) {
+    hosts[COM] = state;
+    await timers.get(PROBE_MS)();
+  }
+  assert.equal(publishedBase(h), `https://${RU}/v1`);
+  assert.equal(h.snapshots.length, before);
+  hosts[COM] = "up";
+  await timers.get(PROBE_MS)();
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${COM}/v1`);
+});
+
+test("HTTP error statuses mean the domain is reachable and never trigger a switch", async () => {
+  for (const status of [401, 403, 404, 429, 500, 502, 503]) {
+    const { h, hosts, calls } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+    const before = h.snapshots.length;
+    hosts[COM] = status;
+    const probed = calls.length;
+    await timers.get(PROBE_MS)();
+    assert.equal(publishedBase(h), `https://${COM}/v1`, `status ${status}`);
+    assert.equal(h.snapshots.length, before, `status ${status}`);
+    assert.deepEqual(calls.slice(probed), [COM], `status ${status}: only the active domain is probed`);
+    cleanup();
+    cleanup = undefined;
+  }
+});
+
+test("all domains unreachable keeps the current address and does not republish", async () => {
+  const { h, hosts } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  const before = h.snapshots.length;
+  hosts[COM] = hosts[RU] = hosts[ONLINE] = "down";
+  await timers.get(PROBE_MS)();
+  await timers.get(PROBE_MS)();
+  assert.equal(publishedBase(h), `https://${COM}/v1`);
+  assert.equal(h.snapshots.length, before);
+});
+
+test("at most one probe cycle is in flight", async () => {
+  const { hosts, calls } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  const hold = deferred();
+  hosts[COM] = hold.promise;
+  const before = calls.length;
+  const first = timers.get(PROBE_MS)();
+  await until(() => calls.length === before + 1);
+  await timers.get(PROBE_MS)();
+  await timers.get(PROBE_MS)();
+  assert.equal(calls.length, before + 1);
+  hold.resolve(new Response("{}", { status: 503 }));
+  await first;
+  hosts[COM] = "up";
+  await timers.get(PROBE_MS)();
+  assert.equal(calls.length, before + 2);
+});
+
+test("an account change discards the result of a probe made with the old key", async () => {
+  const { h, hosts, calls } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  const hold = deferred();
+  hosts[COM] = hold.promise;
+  const before = calls.length;
+  const probing = timers.get(PROBE_MS)();
+  await until(() => calls.length === before + 1);
+  h.key("failover-other-key");
+  h.emit();
+  await probing;
+  assert.equal(publishedBase(h), `https://${COM}/v1`);
+  await until(() => h.current().provider.settings.apiKey === "failover-other-key");
+});
+
+test("an explicit baseURL is never monitored or switched", async () => {
+  const h = harness("explicit-test-key", "https://explicit.invalid/v1");
+  gateway({ "explicit.invalid": "up" });
+  cleanup = await plugin.setup(h.ctx);
+  await until(() => h.current().models[0]?.id === "m");
+  assert.equal(timers.has(PROBE_MS), false);
+  const previous = process.env.RUROUT_BASE_URL;
+  process.env.RUROUT_BASE_URL = "https://env.invalid/v1";
+  try {
+    const env = harness("explicit-env-key", null);
+    gateway({ "env.invalid": "up" });
+    const stop = await plugin.setup(env.ctx);
+    const stopBoth = cleanup;
+    cleanup = () => { stopBoth(); stop(); };
+    await until(() => env.current().models[0]?.id === "m");
+    assert.equal(timers.has(PROBE_MS), false);
+    assert.equal(publishedBase(env), "https://env.invalid/v1");
+  } finally {
+    if (previous === undefined) delete process.env.RUROUT_BASE_URL;
+    else process.env.RUROUT_BASE_URL = previous;
+  }
+});
+
+test("unloading stops the probe timer and cancels a probe in flight", async () => {
+  const { h, hosts, calls } = await started({ [COM]: "up", [RU]: "up", [ONLINE]: "up" });
+  assert.equal(timers.has(PROBE_MS), true);
+  const tick = timers.get(PROBE_MS);
+  const hold = deferred();
+  hosts[COM] = hold.promise;
+  const before = calls.length;
+  const probing = tick();
+  await until(() => calls.length === before + 1);
+  const published = h.snapshots.length;
+  cleanup();
+  cleanup = undefined;
+  assert.equal(timers.has(PROBE_MS), false);
+  await probing;
+  assert.equal(h.snapshots.length, published);
 });
